@@ -1,6 +1,6 @@
 {
 	"name": "@willtmc/gmcli",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"description": "Minimal Gmail CLI (fork with bug fixes)",
 	"repository": {
 		"type": "git",

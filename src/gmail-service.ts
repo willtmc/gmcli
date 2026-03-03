@@ -357,6 +357,7 @@ export class GmailService {
 			threadId?: string;
 			replyToMessageId?: string;
 			attachments?: string[];
+			html?: boolean;
 		} = {},
 	): Promise<GmailDraft> {
 		const gmail = this.getGmailClient(email);
@@ -407,6 +408,7 @@ export class GmailService {
 
 		const hasAttachments = options.attachments && options.attachments.length > 0;
 		const boundary = `boundary_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+		const contentType = options.html ? "text/html" : "text/plain";
 
 		const headers = [
 			`From: ${email}`,
@@ -419,7 +421,7 @@ export class GmailService {
 			"MIME-Version: 1.0",
 			hasAttachments
 				? `Content-Type: multipart/mixed; boundary="${boundary}"`
-				: "Content-Type: text/plain; charset=UTF-8",
+				: `Content-Type: ${contentType}; charset=UTF-8`,
 		].filter(Boolean);
 
 		let emailContent: string;
@@ -427,8 +429,8 @@ export class GmailService {
 		if (hasAttachments) {
 			const parts: string[] = [];
 
-			// Text body part
-			parts.push(`--${boundary}\r\n` + "Content-Type: text/plain; charset=UTF-8\r\n\r\n" + body);
+			// Body part
+			parts.push(`--${boundary}\r\n` + `Content-Type: ${contentType}; charset=UTF-8\r\n\r\n` + body);
 
 			// Attachment parts
 			for (const filePath of options.attachments!) {
@@ -534,7 +536,13 @@ export class GmailService {
 		to: string[],
 		subject: string,
 		body: string,
-		options: { cc?: string[]; bcc?: string[]; replyToMessageId?: string; attachments?: string[] } = {},
+		options: {
+			cc?: string[];
+			bcc?: string[];
+			replyToMessageId?: string;
+			attachments?: string[];
+			html?: boolean;
+		} = {},
 	): Promise<GmailMessage> {
 		const gmail = this.getGmailClient(email);
 
@@ -584,6 +592,7 @@ export class GmailService {
 
 		const hasAttachments = options.attachments && options.attachments.length > 0;
 		const boundary = `boundary_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+		const contentType = options.html ? "text/html" : "text/plain";
 
 		const headers = [
 			`From: ${email}`,
@@ -596,7 +605,7 @@ export class GmailService {
 			"MIME-Version: 1.0",
 			hasAttachments
 				? `Content-Type: multipart/mixed; boundary="${boundary}"`
-				: "Content-Type: text/plain; charset=UTF-8",
+				: `Content-Type: ${contentType}; charset=UTF-8`,
 		].filter(Boolean);
 
 		let emailContent: string;
@@ -604,8 +613,8 @@ export class GmailService {
 		if (hasAttachments) {
 			const parts: string[] = [];
 
-			// Text body part
-			parts.push(`--${boundary}\r\n` + "Content-Type: text/plain; charset=UTF-8\r\n\r\n" + body);
+			// Body part
+			parts.push(`--${boundary}\r\n` + `Content-Type: ${contentType}; charset=UTF-8\r\n\r\n` + body);
 
 			// Attachment parts
 			for (const filePath of options.attachments!) {

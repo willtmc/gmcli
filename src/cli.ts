@@ -72,6 +72,8 @@ GMAIL COMMANDS
         --to <emails>           Recipients (comma-separated, required)
         --subject <s>           Subject line (required)
         --body <b>              Message body (required)
+        --body-file <path>      Read body from file (overrides --body)
+        --html                  Send as HTML email (default: plain text)
         --cc <emails>           CC recipients (comma-separated)
         --bcc <emails>          BCC recipients (comma-separated)
         --reply-to <messageId>  Reply to message (sets headers and thread)
@@ -458,20 +460,26 @@ async function handleDrafts(account: string, args: string[]) {
 					bcc: { type: "string" },
 					subject: { type: "string" },
 					body: { type: "string" },
+					"body-file": { type: "string" },
+					html: { type: "boolean" },
 					thread: { type: "string" },
 					"reply-to": { type: "string" },
 					attach: { type: "string", multiple: true },
 				},
 			});
-			if (!values.to || !values.subject || !values.body) {
-				error("Usage: <email> drafts create --to <emails> --subject <subj> --body <body>");
+			const bodyContent = values["body-file"] ? fs.readFileSync(values["body-file"], "utf8") : values.body;
+			if (!values.to || !values.subject || !bodyContent) {
+				error(
+					"Usage: <email> drafts create --to <emails> --subject <subj> --body <body> [--body-file <path>] [--html]",
+				);
 			}
-			const draft = await service.createDraft(account, values.to.split(","), values.subject, values.body, {
+			const draft = await service.createDraft(account, values.to.split(","), values.subject, bodyContent, {
 				cc: values.cc?.split(","),
 				bcc: values.bcc?.split(","),
 				threadId: values.thread,
 				replyToMessageId: values["reply-to"],
 				attachments: values.attach,
+				html: values.html,
 			});
 			console.log(`Draft created: ${draft.id}`);
 			break;
@@ -490,20 +498,24 @@ async function handleSend(account: string, args: string[]) {
 			bcc: { type: "string" },
 			subject: { type: "string" },
 			body: { type: "string" },
+			"body-file": { type: "string" },
+			html: { type: "boolean" },
 			"reply-to": { type: "string" },
 			attach: { type: "string", multiple: true },
 		},
 	});
 
-	if (!values.to || !values.subject || !values.body) {
-		error("Usage: <email> send --to <emails> --subject <subj> --body <body>");
+	const bodyContent = values["body-file"] ? fs.readFileSync(values["body-file"], "utf8") : values.body;
+	if (!values.to || !values.subject || !bodyContent) {
+		error("Usage: <email> send --to <emails> --subject <subj> --body <body> [--body-file <path>] [--html]");
 	}
 
-	const msg = await service.sendMessage(account, values.to.split(","), values.subject, values.body, {
+	const msg = await service.sendMessage(account, values.to.split(","), values.subject, bodyContent, {
 		cc: values.cc?.split(","),
 		bcc: values.bcc?.split(","),
 		replyToMessageId: values["reply-to"],
 		attachments: values.attach,
+		html: values.html,
 	});
 	console.log(`Sent: ${msg.id}`);
 }
