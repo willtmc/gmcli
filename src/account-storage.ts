@@ -7,6 +7,13 @@ const CONFIG_DIR = path.join(os.homedir(), ".gmcli");
 const ACCOUNTS_FILE = path.join(CONFIG_DIR, "accounts.json");
 const CREDENTIALS_FILE = path.join(CONFIG_DIR, "credentials.json");
 
+// Strip OAuth-app credentials (clientId/clientSecret) from a stored account.
+// Those values must come from env (Doppler) at runtime, not at-rest on disk.
+function sanitizeForStorage(account: EmailAccount): EmailAccount {
+	const { clientId: _cid, clientSecret: _cs, ...rest } = account.oauth2;
+	return { email: account.email, oauth2: { ...rest } };
+}
+
 export class AccountStorage {
 	private accounts: Map<string, EmailAccount> = new Map();
 
@@ -17,7 +24,7 @@ export class AccountStorage {
 
 	private ensureConfigDir(): void {
 		if (!fs.existsSync(CONFIG_DIR)) {
-			fs.mkdirSync(CONFIG_DIR, { recursive: true });
+			fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
 		}
 	}
 
@@ -35,7 +42,8 @@ export class AccountStorage {
 	}
 
 	private saveAccounts(): void {
-		fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(Array.from(this.accounts.values()), null, 2));
+		const sanitized = Array.from(this.accounts.values()).map(sanitizeForStorage);
+		fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(sanitized, null, 2), { mode: 0o600 });
 	}
 
 	addAccount(account: EmailAccount): void {
@@ -62,10 +70,15 @@ export class AccountStorage {
 	}
 
 	setCredentials(clientId: string, clientSecret: string): void {
-		fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify({ clientId, clientSecret }, null, 2));
+		fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify({ clientId, clientSecret }, null, 2), { mode: 0o600 });
 	}
 
 	getCredentials(): { clientId: string; clientSecret: string } | null {
+		const envId = process.env.GMCLI_CLIENT_ID;
+		const envSecret = process.env.GMCLI_CLIENT_SECRET;
+		if (envId && envSecret) {
+			return { clientId: envId, clientSecret: envSecret };
+		}
 		if (!fs.existsSync(CREDENTIALS_FILE)) return null;
 		try {
 			return JSON.parse(fs.readFileSync(CREDENTIALS_FILE, "utf8"));

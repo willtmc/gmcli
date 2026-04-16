@@ -99,11 +99,21 @@ export class GmailService {
 				throw new Error(`Account '${email}' not found`);
 			}
 
-			const oauth2Client = new OAuth2Client(
-				account.oauth2.clientId,
-				account.oauth2.clientSecret,
-				"http://localhost",
-			);
+			// Prefer Doppler-injected env credentials. Fall back to per-account
+			// stored credentials only for backward compatibility with older
+			// accounts.json records that pre-date the env-first migration.
+			const sharedCreds = this.accountStorage.getCredentials();
+			const clientId = sharedCreds?.clientId || account.oauth2.clientId;
+			const clientSecret = sharedCreds?.clientSecret || account.oauth2.clientSecret;
+
+			if (!clientId || !clientSecret) {
+				throw new Error(
+					"OAuth client credentials not found. Set GMCLI_CLIENT_ID and GMCLI_CLIENT_SECRET " +
+						"(typically via `doppler run -- gmcli ...`), or run `gmcli accounts credentials <file.json>`.",
+				);
+			}
+
+			const oauth2Client = new OAuth2Client(clientId, clientSecret, "http://localhost");
 
 			oauth2Client.setCredentials({
 				refresh_token: account.oauth2.refreshToken,
