@@ -69,15 +69,23 @@ GMAIL COMMANDS
       Send an email directly.
 
       Options for drafts create / send:
-        --to <emails>           Recipients (comma-separated, required)
-        --subject <s>           Subject line (required)
-        --body <b>              Message body (required)
-        --body-file <path>      Read body from file (overrides --body)
-        --html                  Send as HTML email (default: plain text)
-        --cc <emails>           CC recipients (comma-separated)
-        --bcc <emails>          BCC recipients (comma-separated)
-        --reply-to <messageId>  Reply to message (sets headers and thread)
-        --attach <file>         Attach file (use multiple times for multiple files)
+        --to <emails>             Recipients (comma-separated, required)
+        --subject <s>             Subject line (required)
+        --body <b>                Message body (required)
+        --body-file <path>        Read body from file (overrides --body)
+        --html                    Send as HTML email (default: plain text)
+        --cc <emails>             CC recipients (comma-separated)
+        --bcc <emails>            BCC recipients (comma-separated)
+        --reply-to <messageId>    Reply to message (sets In-Reply-To /
+                                  References headers AND threads the reply).
+                                  Accepts a Gmail message ID OR a thread ID;
+                                  thread IDs are resolved to the latest message.
+        --in-reply-to <messageId> Alias for --reply-to (matches the MIME header
+                                  name; either flag works identically).
+        --thread <threadId>       Force a specific Gmail thread without setting
+                                  reply headers. Use --reply-to in normal cases;
+                                  --thread is only for unusual threading needs.
+        --attach <file>           Attach file (use multiple times for multiple files)
 
   gmcli <email> url <threadIds...>
       Generate Gmail web URLs for threads.
@@ -464,20 +472,22 @@ async function handleDrafts(account: string, args: string[]) {
 					html: { type: "boolean" },
 					thread: { type: "string" },
 					"reply-to": { type: "string" },
+					"in-reply-to": { type: "string" },
 					attach: { type: "string", multiple: true },
 				},
 			});
 			const bodyContent = values["body-file"] ? fs.readFileSync(values["body-file"], "utf8") : values.body;
 			if (!values.to || !values.subject || !bodyContent) {
 				error(
-					"Usage: <email> drafts create --to <emails> --subject <subj> --body <body> [--body-file <path>] [--html]",
+					"Usage: <email> drafts create --to <emails> --subject <subj> --body <body> [--body-file <path>] [--html] [--reply-to <messageId> | --in-reply-to <messageId> | --thread <threadId>]",
 				);
 			}
+			const replyToMessageId = resolveReplyToFlag(values["reply-to"], values["in-reply-to"]);
 			const draft = await service.createDraft(account, values.to.split(","), values.subject, bodyContent, {
 				cc: values.cc?.split(","),
 				bcc: values.bcc?.split(","),
 				threadId: values.thread,
-				replyToMessageId: values["reply-to"],
+				replyToMessageId,
 				attachments: values.attach,
 				html: values.html,
 			});
@@ -501,23 +511,39 @@ async function handleSend(account: string, args: string[]) {
 			"body-file": { type: "string" },
 			html: { type: "boolean" },
 			"reply-to": { type: "string" },
+			"in-reply-to": { type: "string" },
 			attach: { type: "string", multiple: true },
 		},
 	});
 
 	const bodyContent = values["body-file"] ? fs.readFileSync(values["body-file"], "utf8") : values.body;
 	if (!values.to || !values.subject || !bodyContent) {
-		error("Usage: <email> send --to <emails> --subject <subj> --body <body> [--body-file <path>] [--html]");
+		error(
+			"Usage: <email> send --to <emails> --subject <subj> --body <body> [--body-file <path>] [--html] [--reply-to <messageId> | --in-reply-to <messageId>]",
+		);
 	}
 
+	const replyToMessageId = resolveReplyToFlag(values["reply-to"], values["in-reply-to"]);
 	const msg = await service.sendMessage(account, values.to.split(","), values.subject, bodyContent, {
 		cc: values.cc?.split(","),
 		bcc: values.bcc?.split(","),
-		replyToMessageId: values["reply-to"],
+		replyToMessageId,
 		attachments: values.attach,
 		html: values.html,
 	});
 	console.log(`Sent: ${msg.id}`);
+}
+
+// Accept both --reply-to and its --in-reply-to alias. If the caller supplies both
+// with conflicting values, fail loudly rather than silently picking one.
+function resolveReplyToFlag(replyTo: string | undefined, inReplyTo: string | undefined): string | undefined {
+	if (replyTo && inReplyTo && replyTo !== inReplyTo) {
+		error(
+			`--reply-to (${replyTo}) and --in-reply-to (${inReplyTo}) were both supplied with different values. ` +
+				"Pass only one (they are aliases for the same option).",
+		);
+	}
+	return replyTo ?? inReplyTo;
 }
 
 function handleUrl(account: string, args: string[]) {

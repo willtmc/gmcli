@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.1
+
+### Added
+- `--in-reply-to <messageId>` accepted as an alias for `--reply-to` on both `drafts create` and `send`. Matches the MIME header name; either flag works identically. Passing both with different values is now a hard error rather than silently picking one.
+
+### Changed
+- Help text for reply / threading flags rewritten to clarify that `--reply-to` accepts both message IDs and thread IDs (thread IDs are resolved to the latest message), and that `--thread` is the escape hatch for forcing a thread without setting reply headers.
+
+## 0.4.0
+
+Env-first OAuth credentials. `gmcli` now reads `GMCLI_CLIENT_ID` and `GMCLI_CLIENT_SECRET` from the environment before falling back to `~/.gmcli/credentials.json`, which makes it usable under secret-injection tools like `doppler run --` without a credentials file on disk.
+
+## 0.3.0
+
+- `--html` flag for sending HTML-bodied messages from `drafts create` and `send`.
+- `--body-file <path>` flag for reading the message body from a file (useful for long bodies and avoiding shell quoting issues).
+
 ## 0.2.0
 
 Fork of @mariozechner/gmcli with bug fixes.
