@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.2
+
+### Fixed
+- `thread --download` now recursively walks nested MIME parts, so attachments inside `multipart/related` / inline-style layouts are discovered and downloaded instead of incorrectly reporting `No attachments`.
+- Attachment detection is now shared between metadata listing, search result summaries, and download flows, preventing traversal mismatches.
+- When attachment metadata exists but download yields zero files, `gmcli` now emits a warning to stderr instead of silently failing.
+
+### Added
+- Regression tests covering nested `multipart/related` attachments and inline filename parts with embedded body data.
+
 ## 0.4.1
 
 ### Added
