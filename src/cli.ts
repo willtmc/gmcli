@@ -2,7 +2,7 @@
 
 import * as fs from "fs";
 import { parseArgs } from "util";
-import { GmailService } from "./gmail-service.js";
+import { GmailService, collectAttachmentParts } from "./gmail-service.js";
 
 const service = new GmailService();
 
@@ -288,7 +288,7 @@ async function handleThread(account: string, args: string[]) {
 			console.log("");
 			console.log(decodeBody(msg.payload));
 			console.log("");
-			const attachments = getAttachments(msg.payload);
+			const attachments = collectAttachmentParts(msg.payload);
 			if (attachments.length > 0) {
 				console.log("Attachments:");
 				for (const att of attachments) {
@@ -325,28 +325,6 @@ function decodeBody(payload: any): string {
 		}
 	}
 	return "";
-}
-
-interface AttachmentInfo {
-	filename: string;
-	size: number;
-	mimeType: string;
-}
-
-function getAttachments(payload: any): AttachmentInfo[] {
-	const attachments: AttachmentInfo[] = [];
-	if (!payload?.parts) return attachments;
-	for (const part of payload.parts) {
-		if (part.filename && part.body?.attachmentId) {
-			attachments.push({
-				filename: part.filename,
-				size: part.body.size || 0,
-				mimeType: part.mimeType || "application/octet-stream",
-			});
-		}
-		attachments.push(...getAttachments(part));
-	}
-	return attachments;
 }
 
 async function handleLabels(account: string, args: string[]) {
@@ -434,7 +412,7 @@ async function handleDrafts(account: string, args: string[]) {
 					console.log("");
 					console.log(decodeBody(msg.payload));
 					console.log("");
-					const attachments = getAttachments(msg.payload);
+					const attachments = collectAttachmentParts(msg.payload);
 					if (attachments.length > 0) {
 						console.log("Attachments:");
 						for (const att of attachments) {

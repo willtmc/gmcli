@@ -49,6 +49,50 @@ export interface DownloadedAttachment {
 	cached: boolean;
 }
 
+export interface AttachmentPartInfo {
+	filename: string;
+	size: number;
+	mimeType: string;
+	attachmentId?: string;
+	inlineData?: string;
+	partPath: string;
+}
+
+interface AttachmentDownloadTarget extends AttachmentPartInfo {
+	messageId: string;
+}
+
+export function collectAttachmentParts(payload: gmail_v1.Schema$MessagePart | null | undefined): AttachmentPartInfo[] {
+	const attachments: AttachmentPartInfo[] = [];
+
+	const walk = (part: gmail_v1.Schema$MessagePart | null | undefined, partPath: string) => {
+		if (!part) return;
+
+		const filename = part.filename?.trim();
+		if (filename) {
+			attachments.push({
+				filename,
+				size: part.body?.size || 0,
+				mimeType: part.mimeType || "application/octet-stream",
+				attachmentId: part.body?.attachmentId || undefined,
+				inlineData: part.body?.data || undefined,
+				partPath,
+			});
+		}
+
+		for (let i = 0; i < (part.parts || []).length; i++) {
+			walk(part.parts?.[i], `${partPath}.${i}`);
+		}
+	};
+
+	walk(payload, "0");
+	return attachments;
+}
+
+export function hasAttachmentParts(payload: gmail_v1.Schema$MessagePart | null | undefined): boolean {
+	return collectAttachmentParts(payload).length > 0;
+}
+
 export interface LabelOperationResult {
 	threadId: string;
 	success: boolean;
@@ -159,7 +203,7 @@ export class GmailService {
 					to: this.getHeaderValue(msg, "to"),
 					subject: this.getHeaderValue(msg, "subject"),
 					date: this.getHeaderValue(msg, "date"),
-					hasAttachments: msg.payload?.parts?.some((part) => part.filename && part.filename.length > 0) || false,
+					hasAttachments: hasAttachmentParts(msg.payload),
 				})),
 			})),
 			nextPageToken: response.data.nextPageToken,
@@ -183,36 +227,30 @@ export class GmailService {
 			return thread;
 		}
 
-		const attachmentsToDownload: Array<{
-			messageId: string;
-			attachmentId: string;
-			filename: string;
-			size: number;
-			mimeType: string;
-		}> = [];
+		const attachmentMetadata: AttachmentDownloadTarget[] = (thread.messages || []).flatMap((message: GmailMessage) =>
+			collectAttachmentParts(message.payload).map((part: AttachmentPartInfo) => ({
+				messageId: message.id!,
+				filename: part.filename,
+				size: part.size,
+				mimeType: part.mimeType,
+				attachmentId: part.attachmentId,
+				inlineData: part.inlineData,
+				partPath: part.partPath,
+			})),
+		);
 
-		for (const message of thread.messages || []) {
-			if (message.payload?.parts) {
-				for (const part of message.payload.parts) {
-					if (part.body?.attachmentId && part.filename) {
-						attachmentsToDownload.push({
-							messageId: message.id!,
-							attachmentId: part.body.attachmentId,
-							filename: part.filename,
-							size: part.body.size || 0,
-							mimeType: part.mimeType || "application/octet-stream",
-						});
-					}
-				}
-			}
-		}
+		const attachmentsToDownload = attachmentMetadata.filter(
+			(part: AttachmentDownloadTarget) => part.attachmentId || part.inlineData,
+		);
 
 		const downloadResults = await this.downloadAttachments(
 			email,
-			attachmentsToDownload.map((att) => ({
+			attachmentsToDownload.map((att: AttachmentDownloadTarget) => ({
 				messageId: att.messageId,
 				attachmentId: att.attachmentId,
+				inlineData: att.inlineData,
 				filename: att.filename,
+				partPath: att.partPath,
 			})),
 		);
 
@@ -234,12 +272,24 @@ export class GmailService {
 			}
 		}
 
+		if (attachmentMetadata.length > 0 && downloadedAttachments.length === 0) {
+			console.error(
+				`[gmcli] Warning: attachment metadata listed ${attachmentMetadata.length} attachment(s), but none were downloaded for thread ${threadId}.`,
+			);
+		}
+
 		return downloadedAttachments;
 	}
 
 	async downloadAttachments(
 		email: string,
-		attachments: Array<{ messageId: string; attachmentId: string; filename: string }>,
+		attachments: Array<{
+			messageId: string;
+			attachmentId?: string;
+			inlineData?: string;
+			filename: string;
+			partPath: string;
+		}>,
 	): Promise<AttachmentDownloadResult[]> {
 		const gmail = this.getGmailClient(email);
 		const results: AttachmentDownloadResult[] = [];
@@ -251,9 +301,26 @@ export class GmailService {
 
 		for (const attachment of attachments) {
 			try {
-				const shortAttachmentId = attachment.attachmentId.substring(0, 8);
-				const filename = `${attachment.messageId}_${shortAttachmentId}_${attachment.filename}`;
+				const sourceKey =
+					attachment.attachmentId?.substring(0, 8) || `part-${attachment.partPath.replace(/\./g, "-")}`;
+				const filename = `${attachment.messageId}_${sourceKey}_${attachment.filename}`;
 				const filePath = path.join(attachmentDir, filename);
+
+				if (attachment.inlineData) {
+					const data = Buffer.from(attachment.inlineData, "base64url");
+					if (fs.existsSync(filePath) && fs.statSync(filePath).size === data.length) {
+						results.push({ success: true, filename: attachment.filename, path: filePath, cached: true });
+						continue;
+					}
+
+					fs.writeFileSync(filePath, data);
+					results.push({ success: true, filename: attachment.filename, path: filePath, cached: false });
+					continue;
+				}
+
+				if (!attachment.attachmentId) {
+					throw new Error("Attachment has no attachmentId or inline data");
+				}
 
 				if (fs.existsSync(filePath)) {
 					const existingSize = fs.statSync(filePath).size;
@@ -662,38 +729,30 @@ export class GmailService {
 		const response = await gmail.users.messages.get({ userId: "me", id: messageId });
 		const message = response.data;
 
-		const attachmentsToDownload: Array<{
-			messageId: string;
-			attachmentId: string;
-			filename: string;
-			size: number;
-			mimeType: string;
-		}> = [];
+		const attachmentMetadata: AttachmentDownloadTarget[] = collectAttachmentParts(message.payload).map(
+			(part: AttachmentPartInfo) => ({
+				messageId,
+				filename: part.filename,
+				size: part.size,
+				mimeType: part.mimeType,
+				attachmentId: part.attachmentId,
+				inlineData: part.inlineData,
+				partPath: part.partPath,
+			}),
+		);
 
-		const collectAttachments = (payload: any) => {
-			if (payload?.parts) {
-				for (const part of payload.parts) {
-					if (part.body?.attachmentId && part.filename) {
-						attachmentsToDownload.push({
-							messageId,
-							attachmentId: part.body.attachmentId,
-							filename: part.filename,
-							size: part.body.size || 0,
-							mimeType: part.mimeType || "application/octet-stream",
-						});
-					}
-					collectAttachments(part);
-				}
-			}
-		};
-		collectAttachments(message.payload);
+		const attachmentsToDownload = attachmentMetadata.filter(
+			(part: AttachmentDownloadTarget) => part.attachmentId || part.inlineData,
+		);
 
 		const downloadResults = await this.downloadAttachments(
 			email,
-			attachmentsToDownload.map((att) => ({
+			attachmentsToDownload.map((att: AttachmentDownloadTarget) => ({
 				messageId: att.messageId,
 				attachmentId: att.attachmentId,
+				inlineData: att.inlineData,
 				filename: att.filename,
+				partPath: att.partPath,
 			})),
 		);
 
@@ -711,6 +770,12 @@ export class GmailService {
 					cached: result.cached || false,
 				});
 			}
+		}
+
+		if (attachmentMetadata.length > 0 && downloadedAttachments.length === 0) {
+			console.error(
+				`[gmcli] Warning: attachment metadata listed ${attachmentMetadata.length} attachment(s), but none were downloaded for message ${messageId}.`,
+			);
 		}
 
 		return downloadedAttachments;
