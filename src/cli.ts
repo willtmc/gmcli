@@ -23,9 +23,11 @@ ACCOUNT COMMANDS
 
 GMAIL COMMANDS
 
-  gmcli <email> search <query> [--max N] [--page TOKEN]
+  gmcli <email> search <query> [--max N|-m N] [--page TOKEN|-p TOKEN]
       Search threads using Gmail query syntax.
       Returns: thread ID, date, sender, subject, labels.
+      --max, -m sets the result limit (default: 10).
+      --page, -p fetches a Gmail next-page token from a prior search.
 
       Query examples:
         in:inbox, in:sent, in:drafts, in:trash
@@ -44,10 +46,11 @@ GMAIL COMMANDS
   gmcli <email> labels list
       List all labels with ID, name, and type.
 
-  gmcli <email> labels <threadIds...> [--add L] [--remove L]
+  gmcli <email> labels <threadIds...> [--add L|-a L] [--remove L|-r L]
       Modify labels on threads (comma-separated for multiple).
       Accepts label names or IDs (names are case-insensitive).
       System labels: INBOX, UNREAD, STARRED, IMPORTANT, TRASH, SPAM
+      --add, -a adds label names or IDs; --remove, -r removes them.
 
   gmcli <email> drafts list
       List all drafts. Returns: draft ID, message ID.
@@ -86,6 +89,10 @@ GMAIL COMMANDS
                                   reply headers. Use --reply-to in normal cases;
                                   --thread is only for unusual threading needs.
         --attach <file>           Attach file (use multiple times for multiple files)
+
+      Short aliases:
+        search: --max/-m, --page/-p
+        labels: --add/-a, --remove/-r
 
   gmcli <email> url <threadIds...>
       Generate Gmail web URLs for threads.
