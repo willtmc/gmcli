@@ -616,6 +616,7 @@ export class GmailService {
 		options: {
 			cc?: string[];
 			bcc?: string[];
+			threadId?: string;
 			replyToMessageId?: string;
 			attachments?: string[];
 			html?: boolean;
@@ -625,7 +626,7 @@ export class GmailService {
 
 		let inReplyTo: string | undefined;
 		let references: string | undefined;
-		let threadId: string | undefined;
+		let threadId: string | undefined = options.threadId;
 
 		// If replying to a specific message, fetch its headers
 		if (options.replyToMessageId) {
@@ -664,7 +665,7 @@ export class GmailService {
 				inReplyTo = messageId;
 				references = existingRefs ? `${existingRefs} ${messageId}` : messageId;
 			}
-			threadId = msg.data.threadId || undefined;
+			threadId = threadId || msg.data.threadId || undefined;
 		}
 
 		const hasAttachments = options.attachments && options.attachments.length > 0;
