@@ -497,6 +497,7 @@ async function handleSend(account: string, args: string[]) {
 			html: { type: "boolean" },
 			"reply-to": { type: "string" },
 			"in-reply-to": { type: "string" },
+			thread: { type: "string" },
 			attach: { type: "string", multiple: true },
 		},
 	});
@@ -504,7 +505,7 @@ async function handleSend(account: string, args: string[]) {
 	const bodyContent = values["body-file"] ? fs.readFileSync(values["body-file"], "utf8") : values.body;
 	if (!values.to || !values.subject || !bodyContent) {
 		error(
-			"Usage: <email> send --to <emails> --subject <subj> --body <body> [--body-file <path>] [--html] [--reply-to <messageId> | --in-reply-to <messageId>]",
+			"Usage: <email> send --to <emails> --subject <subj> --body <body> [--body-file <path>] [--html] [--reply-to <messageId> | --in-reply-to <messageId> | --thread <threadId>]",
 		);
 	}
 
@@ -512,6 +513,7 @@ async function handleSend(account: string, args: string[]) {
 	const msg = await service.sendMessage(account, values.to.split(","), values.subject, bodyContent, {
 		cc: values.cc?.split(","),
 		bcc: values.bcc?.split(","),
+		threadId: values.thread,
 		replyToMessageId,
 		attachments: values.attach,
 		html: values.html,
