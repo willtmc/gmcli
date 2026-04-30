@@ -130,7 +130,7 @@ Options for `drafts create` and `send`:
 - `--body <b>` - Message body (required)
 - `--cc <emails>` - CC recipients (comma-separated)
 - `--bcc <emails>` - BCC recipients (comma-separated)
-- `--reply-to <messageId>` - Reply to message (sets In-Reply-To/References headers and thread; accepts Gmail message ID or thread ID)
+- `--reply-to <messageId>` - Reply to message (sets In-Reply-To/References headers and thread; accepts Gmail message ID or thread ID; canonicalizes equivalent reply subjects to Gmail's source thread subject)
 - `--in-reply-to <messageId>` - Alias for `--reply-to`
 - `--thread <threadId>` - Force a specific Gmail thread without setting reply headers; prefer `--reply-to` for normal replies
 - `--attach <file>` - Attach file (can be used multiple times)

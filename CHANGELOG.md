@@ -3,6 +3,7 @@
 ## 0.4.2
 
 ### Fixed
+- Replies created with `--reply-to` / `--in-reply-to` now fetch the source message subject and reuse Gmail's canonical thread subject when the requested subject only differs by common reply/forward prefix casing or spacing. This avoids Gmail API `Subject does not match` failures for threaded drafts/sends.
 - `thread --download` now recursively walks nested MIME parts, so attachments inside `multipart/related` / inline-style layouts are discovered and downloaded instead of incorrectly reporting `No attachments`.
 - Attachment detection is now shared between metadata listing, search result summaries, and download flows, preventing traversal mismatches.
 - When attachment metadata exists but download yields zero files, `gmcli` now emits a warning to stderr instead of silently failing.
