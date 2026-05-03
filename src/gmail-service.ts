@@ -93,6 +93,23 @@ export function hasAttachmentParts(payload: gmail_v1.Schema$MessagePart | null |
 	return collectAttachmentParts(payload).length > 0;
 }
 
+export function normalizeSubjectForThreadComparison(subject: string | undefined): string {
+	return (subject || "")
+		.trim()
+		.replace(/^(\s*(re|fw|fwd)\s*:\s*)+/i, "")
+		.replace(/\s+/g, " ")
+		.toLowerCase();
+}
+
+export function canonicalReplySubject(requestedSubject: string, sourceSubject: string | undefined): string {
+	if (!sourceSubject) return requestedSubject;
+	if (!requestedSubject.trim()) return sourceSubject;
+
+	return normalizeSubjectForThreadComparison(requestedSubject) === normalizeSubjectForThreadComparison(sourceSubject)
+		? sourceSubject
+		: requestedSubject;
+}
+
 export interface LabelOperationResult {
 	threadId: string;
 	success: boolean;
@@ -442,6 +459,7 @@ export class GmailService {
 		let inReplyTo: string | undefined;
 		let references: string | undefined;
 		let threadId = options.threadId;
+		let messageSubject = subject;
 
 		// If replying to a specific message, fetch its headers
 		if (options.replyToMessageId) {
@@ -470,11 +488,13 @@ export class GmailService {
 				userId: "me",
 				id: messageIdToFetch,
 				format: "metadata",
-				metadataHeaders: ["Message-ID", "References"],
+				metadataHeaders: ["Message-ID", "References", "Subject"],
 			});
 			const headers = msg.data.payload?.headers || [];
 			const messageId = headers.find((h: any) => h.name === "Message-ID")?.value;
 			const existingRefs = headers.find((h: any) => h.name === "References")?.value;
+			const sourceSubject = headers.find((h: any) => h.name?.toLowerCase() === "subject")?.value;
+			messageSubject = canonicalReplySubject(messageSubject, sourceSubject);
 
 			if (messageId) {
 				inReplyTo = messageId;
@@ -492,7 +512,7 @@ export class GmailService {
 			`To: ${to.join(", ")}`,
 			options.cc?.length ? `Cc: ${options.cc.join(", ")}` : "",
 			options.bcc?.length ? `Bcc: ${options.bcc.join(", ")}` : "",
-			`Subject: ${subject}`,
+			`Subject: ${messageSubject}`,
 			inReplyTo ? `In-Reply-To: ${inReplyTo}` : "",
 			references ? `References: ${references}` : "",
 			"MIME-Version: 1.0",
@@ -627,6 +647,7 @@ export class GmailService {
 		let inReplyTo: string | undefined;
 		let references: string | undefined;
 		let threadId: string | undefined = options.threadId;
+		let messageSubject = subject;
 
 		// If replying to a specific message, fetch its headers
 		if (options.replyToMessageId) {
@@ -655,11 +676,13 @@ export class GmailService {
 				userId: "me",
 				id: messageIdToFetch,
 				format: "metadata",
-				metadataHeaders: ["Message-ID", "References"],
+				metadataHeaders: ["Message-ID", "References", "Subject"],
 			});
 			const headers = msg.data.payload?.headers || [];
 			const messageId = headers.find((h: any) => h.name === "Message-ID")?.value;
 			const existingRefs = headers.find((h: any) => h.name === "References")?.value;
+			const sourceSubject = headers.find((h: any) => h.name?.toLowerCase() === "subject")?.value;
+			messageSubject = canonicalReplySubject(messageSubject, sourceSubject);
 
 			if (messageId) {
 				inReplyTo = messageId;
@@ -677,7 +700,7 @@ export class GmailService {
 			`To: ${to.join(", ")}`,
 			options.cc?.length ? `Cc: ${options.cc.join(", ")}` : "",
 			options.bcc?.length ? `Bcc: ${options.bcc.join(", ")}` : "",
-			`Subject: ${subject}`,
+			`Subject: ${messageSubject}`,
 			inReplyTo ? `In-Reply-To: ${inReplyTo}` : "",
 			references ? `References: ${references}` : "",
 			"MIME-Version: 1.0",
