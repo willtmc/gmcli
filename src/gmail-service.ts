@@ -93,6 +93,10 @@ export function hasAttachmentParts(payload: gmail_v1.Schema$MessagePart | null |
 	return collectAttachmentParts(payload).length > 0;
 }
 
+export function isDraftMessage(message: Pick<GmailMessage, "labelIds"> | null | undefined): boolean {
+	return message?.labelIds?.includes("DRAFT") || false;
+}
+
 export function normalizeSubjectForThreadComparison(subject: string | undefined): string {
 	return (subject || "")
 		.trim()

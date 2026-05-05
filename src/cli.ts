@@ -2,7 +2,7 @@
 
 import * as fs from "fs";
 import { parseArgs } from "util";
-import { GmailService, collectAttachmentParts } from "./gmail-service.js";
+import { GmailService, collectAttachmentParts, isDraftMessage } from "./gmail-service.js";
 
 const service = new GmailService();
 
@@ -287,10 +287,18 @@ async function handleThread(account: string, args: string[]) {
 			const headers = msg.payload?.headers || [];
 			const getHeader = (name: string) =>
 				headers.find((h: any) => h.name?.toLowerCase() === name.toLowerCase())?.value || "";
+			const isDraft = isDraftMessage(msg);
 			console.log(`Message-ID: ${msg.id}`);
+			if (isDraft) {
+				console.log("Status: DRAFT (not sent)");
+			}
 			console.log(`From: ${getHeader("from")}`);
 			console.log(`To: ${getHeader("to")}`);
-			console.log(`Date: ${getHeader("date")}`);
+			if (isDraft) {
+				console.log(`Last-saved: ${formatInternalDate(msg.internalDate) || getHeader("date")}`);
+			} else {
+				console.log(`Date: ${getHeader("date")}`);
+			}
 			console.log(`Subject: ${getHeader("subject")}`);
 			console.log("");
 			console.log(decodeBody(msg.payload));
@@ -306,6 +314,13 @@ async function handleThread(account: string, args: string[]) {
 			console.log("---");
 		}
 	}
+}
+
+function formatInternalDate(internalDate: string | null | undefined): string {
+	if (!internalDate) return "";
+	const timestamp = Number(internalDate);
+	if (!Number.isFinite(timestamp)) return "";
+	return new Date(timestamp).toISOString();
 }
 
 function formatSize(bytes: number): string {
