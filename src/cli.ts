@@ -456,7 +456,7 @@ async function handleDrafts(account: string, args: string[]) {
 			const draftId = rest[0];
 			if (!draftId) error("Usage: <email> drafts send <draftId>");
 			const msg = await service.sendDraft(account, draftId);
-			console.log(`Sent: ${msg.id}`);
+			console.log(`Sent: ${msg.id}${msg.threadId ? ` thread: ${msg.threadId}` : ""}`);
 			break;
 		}
 		case "create": {
@@ -491,7 +491,10 @@ async function handleDrafts(account: string, args: string[]) {
 				attachments: values.attach,
 				html: values.html,
 			});
-			console.log(`Draft created: ${draft.id}`);
+			const draftMessage = draft.message;
+			console.log(
+				`Draft created: ${draft.id}${draftMessage?.id ? ` message: ${draftMessage.id}` : ""}${draftMessage?.threadId ? ` thread: ${draftMessage.threadId}` : ""}`,
+			);
 			break;
 		}
 		default:
@@ -533,7 +536,7 @@ async function handleSend(account: string, args: string[]) {
 		attachments: values.attach,
 		html: values.html,
 	});
-	console.log(`Sent: ${msg.id}`);
+	console.log(`Sent: ${msg.id}${msg.threadId ? ` thread: ${msg.threadId}` : ""}`);
 }
 
 // Accept both --reply-to and its --in-reply-to alias. If the caller supplies both
