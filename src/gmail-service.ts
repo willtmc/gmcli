@@ -114,6 +114,11 @@ export function canonicalReplySubject(requestedSubject: string, sourceSubject: s
 		: requestedSubject;
 }
 
+export function encodeMimeHeader(value: string): string {
+	if (/^[\x20-\x7e]*$/.test(value)) return value;
+	return `=?UTF-8?B?${Buffer.from(value, "utf8").toString("base64")}?=`;
+}
+
 export interface LabelOperationResult {
 	threadId: string;
 	success: boolean;
@@ -516,7 +521,7 @@ export class GmailService {
 			`To: ${to.join(", ")}`,
 			options.cc?.length ? `Cc: ${options.cc.join(", ")}` : "",
 			options.bcc?.length ? `Bcc: ${options.bcc.join(", ")}` : "",
-			`Subject: ${messageSubject}`,
+			`Subject: ${encodeMimeHeader(messageSubject)}`,
 			inReplyTo ? `In-Reply-To: ${inReplyTo}` : "",
 			references ? `References: ${references}` : "",
 			"MIME-Version: 1.0",
@@ -704,7 +709,7 @@ export class GmailService {
 			`To: ${to.join(", ")}`,
 			options.cc?.length ? `Cc: ${options.cc.join(", ")}` : "",
 			options.bcc?.length ? `Bcc: ${options.bcc.join(", ")}` : "",
-			`Subject: ${messageSubject}`,
+			`Subject: ${encodeMimeHeader(messageSubject)}`,
 			inReplyTo ? `In-Reply-To: ${inReplyTo}` : "",
 			references ? `References: ${references}` : "",
 			"MIME-Version: 1.0",

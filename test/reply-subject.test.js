@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
 	GmailService,
 	canonicalReplySubject,
+	encodeMimeHeader,
 	normalizeSubjectForThreadComparison,
 } from "../dist/gmail-service.js";
 
@@ -32,6 +33,11 @@ test("canonicalReplySubject does not rewrite materially different subjects", () 
 		canonicalReplySubject("New topic", "RE: FW: LeRoy Jeffery Thomas; 26-01103 - ISSUES"),
 		"New topic",
 	);
+});
+
+test("encodeMimeHeader leaves ascii alone and encodes unicode headers", () => {
+	assert.equal(encodeMimeHeader("Plain subject"), "Plain subject");
+	assert.equal(encodeMimeHeader("Inline composer demo — draft only"), "=?UTF-8?B?SW5saW5lIGNvbXBvc2VyIGRlbW8g4oCUIGRyYWZ0IG9ubHk=?=");
 });
 
 test("createDraft canonicalizes reply subject before sending raw payload to Gmail", async () => {
