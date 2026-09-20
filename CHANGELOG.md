@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.0
+
+### Added
+- `--json` on programmatic read commands: `search`, `thread`, `url`, `drafts list`, `drafts get`, and `labels list`. Errors emit `{ ok: false, error }` instead of prose when `--json` is set.
+
 ## 0.4.2
 
 ### Fixed

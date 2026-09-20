@@ -3,8 +3,10 @@
 import * as fs from "fs";
 import { parseArgs } from "util";
 import { GmailService, collectAttachmentParts, isDraftMessage } from "./gmail-service.js";
+import { consumeJsonFlag, parseMailbox, parseMailboxList } from "./json-format.js";
 
 const service = new GmailService();
+let jsonOutput = false;
 
 function usage(): never {
 	console.log(`gmcli - Gmail CLI
@@ -28,6 +30,7 @@ GMAIL COMMANDS
       Returns: thread ID, date, sender, subject, labels.
       --max, -m sets the result limit (default: 10).
       --page, -p fetches a Gmail next-page token from a prior search.
+      --json emits a stable machine-readable object instead of TSV/prose.
 
       Query examples:
         in:inbox, in:sent, in:drafts, in:trash
@@ -123,8 +126,16 @@ DATA STORAGE
 }
 
 function error(msg: string): never {
-	console.error("Error:", msg);
+	if (jsonOutput) {
+		console.log(JSON.stringify({ ok: false, error: msg }));
+	} else {
+		console.error("Error:", msg);
+	}
 	process.exit(1);
+}
+
+function emitJson(payload: Record<string, unknown>): void {
+	console.log(JSON.stringify(payload));
 }
 
 async function main() {
@@ -145,8 +156,10 @@ async function main() {
 
 		// All other commands: first arg is email, second is command
 		const account = first;
-		const command = rest[0];
-		const commandArgs = rest.slice(1);
+		const consumed = consumeJsonFlag(rest);
+		jsonOutput = consumed.json;
+		const command = consumed.args[0];
+		const commandArgs = consumed.args.slice(1);
 
 		if (!command) {
 			error("Missing command. Use --help for usage.");
@@ -244,6 +257,27 @@ async function handleSearch(account: string, args: string[]) {
 	const results = await service.searchThreads(account, query, Number(values.max) || 10, values.page);
 	const { idToName } = await service.getLabelMap(account);
 
+	if (jsonOutput) {
+		emitJson({
+			ok: true,
+			query,
+			threads: results.threads.map((t) => {
+				const msg = t.messages[0];
+				return {
+					id: t.id,
+					date: msg?.date || msg?.internalDate || null,
+					from: parseMailbox(msg?.from),
+					subject: msg?.subject || null,
+					labels: msg?.labelIds?.map((id) => idToName.get(id) || id) || [],
+					snippet: msg?.snippet || null,
+					message_ids: t.messages.map((m) => m.id).filter(Boolean),
+				};
+			}),
+			next_page_token: results.nextPageToken || null,
+		});
+		return;
+	}
+
 	if (results.threads.length === 0) {
 		console.log("No results");
 	} else {
@@ -273,6 +307,19 @@ async function handleThread(account: string, args: string[]) {
 
 	if (download) {
 		const attachments = result as any[];
+		if (jsonOutput) {
+			emitJson({
+				ok: true,
+				thread_id: threadId,
+				attachments: attachments.map((a) => ({
+					filename: a.filename,
+					path: a.path,
+					size: a.size,
+					mime_type: a.mimeType || null,
+				})),
+			});
+			return;
+		}
 		if (attachments.length === 0) {
 			console.log("No attachments");
 		} else {
@@ -283,6 +330,36 @@ async function handleThread(account: string, args: string[]) {
 		}
 	} else {
 		const thread = result as any;
+		if (jsonOutput) {
+			emitJson({
+				ok: true,
+				thread_id: thread.id || threadId,
+				messages: (thread.messages || []).map((msg: any) => {
+					const headers = msg.payload?.headers || [];
+					const getHeader = (name: string) =>
+						headers.find((h: any) => h.name?.toLowerCase() === name.toLowerCase())?.value || "";
+					return {
+						id: msg.id,
+						rfc822_message_id: getHeader("message-id") || null,
+						from: parseMailbox(getHeader("from")),
+						to: parseMailboxList(getHeader("to")),
+						cc: parseMailboxList(getHeader("cc")),
+						date: getHeader("date") || formatInternalDate(msg.internalDate) || null,
+						subject: getHeader("subject") || null,
+						body: decodeBody(msg.payload),
+						is_draft: isDraftMessage(msg),
+						label_ids: msg.labelIds || [],
+						attachments: collectAttachmentParts(msg.payload).map((att) => ({
+							filename: att.filename,
+							mime_type: att.mimeType,
+							size: att.size,
+							attachment_id: att.attachmentId || null,
+						})),
+					};
+				}),
+			});
+			return;
+		}
 		for (const msg of thread.messages || []) {
 			const headers = msg.payload?.headers || [];
 			const getHeader = (name: string) =>
@@ -366,6 +443,13 @@ async function handleLabels(account: string, args: string[]) {
 	// labels list
 	if (positionals[0] === "list") {
 		const labels = await service.listLabels(account);
+		if (jsonOutput) {
+			emitJson({
+				ok: true,
+				labels: labels.map((l) => ({ id: l.id, name: l.name, type: l.type })),
+			});
+			return;
+		}
 		console.log("ID\tNAME\tTYPE");
 		for (const l of labels) {
 			console.log(`${l.id}\t${l.name}\t${l.type}`);
@@ -395,6 +479,17 @@ async function handleDrafts(account: string, args: string[]) {
 	switch (action) {
 		case "list": {
 			const drafts = await service.listDrafts(account);
+			if (jsonOutput) {
+				emitJson({
+					ok: true,
+					drafts: drafts.map((d) => ({
+						id: d.id,
+						message_id: d.message?.id || null,
+						thread_id: d.message?.threadId || null,
+					})),
+				});
+				break;
+			}
 			if (drafts.length === 0) {
 				console.log("No drafts");
 			} else {
@@ -427,6 +522,24 @@ async function handleDrafts(account: string, args: string[]) {
 					const headers = msg.payload?.headers || [];
 					const getHeader = (name: string) =>
 						headers.find((h: any) => h.name?.toLowerCase() === name.toLowerCase())?.value || "";
+					if (jsonOutput) {
+						emitJson({
+							ok: true,
+							draft_id: draft.id,
+							message_id: msg.id || null,
+							thread_id: msg.threadId || null,
+							to: parseMailboxList(getHeader("to")),
+							cc: parseMailboxList(getHeader("cc")),
+							subject: getHeader("subject") || null,
+							body: decodeBody(msg.payload),
+							attachments: collectAttachmentParts(msg.payload).map((att) => ({
+								filename: att.filename,
+								mime_type: att.mimeType,
+								size: att.size,
+							})),
+						});
+						break;
+					}
 					console.log(`Draft-ID: ${draft.id}`);
 					console.log(`To: ${getHeader("to")}`);
 					console.log(`Cc: ${getHeader("cc")}`);
@@ -556,9 +669,18 @@ function handleUrl(account: string, args: string[]) {
 		error("Usage: <email> url <threadIds...>");
 	}
 
-	for (const id of args) {
-		const url = `https://mail.google.com/mail/?authuser=${encodeURIComponent(account)}#all/${id}`;
-		console.log(`${id}\t${url}`);
+	const urls = args
+		.filter((id) => id !== "--json")
+		.map((id) => ({
+			thread_id: id,
+			url: `https://mail.google.com/mail/?authuser=${encodeURIComponent(account)}#all/${id}`,
+		}));
+	if (jsonOutput) {
+		emitJson({ ok: true, urls });
+		return;
+	}
+	for (const row of urls) {
+		console.log(`${row.thread_id}\t${row.url}`);
 	}
 }
 
