@@ -10,6 +10,16 @@ Minimal Gmail CLI for searching, reading threads, managing labels, drafts, and s
 npm install -g @willtmc/gmcli
 ```
 
+### Local install from source
+
+To install or update your local global `gmcli` binary from a source checkout, run:
+
+```bash
+npm run install-local
+```
+
+The global `gmcli` bin runs the compiled `dist/cli.js` output (not `src/` directly). `npm run install-local` rebuilds `dist/`, runs `npm install -g .`, and verifies that the `gmcli` binary resolved on `PATH` matches the newly built `dist/cli.js` (exiting non-zero if the installed binary is stale).
+
 ## Setup
 
 Before adding an account, you need OAuth2 credentials from Google Cloud Console:
@@ -187,6 +197,8 @@ All data is stored in `~/.gmcli/`:
 npm install
 npm run build
 npm run check
+npm test
+npm run install-local   # rebuild dist/, install globally, and verify PATH binary
 ```
 
 ## Publishing
