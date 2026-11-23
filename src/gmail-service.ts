@@ -4,6 +4,22 @@ import * as path from "path";
 import { OAuth2Client } from "google-auth-library";
 import { type gmail_v1, google } from "googleapis";
 import { AccountStorage } from "./account-storage.js";
+import {
+	type DraftAuditResult,
+	type RawDraftAuditInput,
+	type SentDuplicateCandidate,
+	type SentMatchKind,
+	THREAD_VERIFICATION_NOTE,
+	buildSentSearchQuery,
+	classifyDraftAuditItems,
+	formatIsoDate,
+	hasOverlappingRecipients,
+	isSentMessage,
+	parseMessageDateMs,
+	parseOlderThan,
+	parseRecipientsHeaders,
+	summarizeDraftAudit,
+} from "./drafts-audit.js";
 import { GmailOAuthFlow } from "./gmail-oauth-flow.js";
 import type { EmailAccount } from "./types.js";
 
@@ -439,6 +455,262 @@ export class GmailService {
 		const gmail = this.getGmailClient(email);
 		const response = await gmail.users.drafts.list({ userId: "me" });
 		return response.data.drafts || [];
+	}
+
+	async auditDrafts(
+		email: string,
+		options: {
+			olderThan?: string;
+			checkSent?: boolean;
+			maxResults?: number;
+			nowMs?: number;
+		} = {},
+	): Promise<DraftAuditResult> {
+		const gmail = this.getGmailClient(email);
+		const parsedOlderThan = parseOlderThan(options.olderThan ?? "1d", options.nowMs);
+		const checkSent = Boolean(options.checkSent);
+		const maxResults = options.maxResults ?? 50;
+
+		const rawItems: RawDraftAuditInput[] = [];
+		let pageToken: string | undefined;
+
+		while (rawItems.length < maxResults) {
+			const listParams: { userId: string; q?: string; maxResults: number; pageToken?: string } = {
+				userId: "me",
+				maxResults: Math.min(100, Math.max(maxResults - rawItems.length, 10)),
+			};
+			if (parsedOlderThan.gmailQueryToken) {
+				listParams.q = parsedOlderThan.gmailQueryToken;
+			}
+			if (pageToken) {
+				listParams.pageToken = pageToken;
+			}
+
+			const listResp = await gmail.users.drafts.list(listParams);
+			const draftStubs: GmailDraft[] = listResp.data.drafts || [];
+			if (draftStubs.length === 0) break;
+
+			for (const stub of draftStubs) {
+				if (!stub.id) continue;
+				const draftResp = await gmail.users.drafts.get({
+					userId: "me",
+					id: stub.id,
+					format: "full",
+				});
+				const draft: GmailDraft = draftResp.data;
+				const msg = draft.message;
+				const headerDate = msg ? this.getHeaderValue(msg, "date") : undefined;
+				const internalDateMs = parseMessageDateMs(msg?.internalDate, headerDate);
+
+				if (
+					parsedOlderThan.cutoffMs !== null &&
+					internalDateMs !== null &&
+					internalDateMs > parsedOlderThan.cutoffMs
+				) {
+					continue;
+				}
+
+				const { to, cc } = parseRecipientsHeaders(
+					msg ? this.getHeaderValue(msg, "to") : undefined,
+					msg ? this.getHeaderValue(msg, "cc") : undefined,
+				);
+				const subject = (msg ? this.getHeaderValue(msg, "subject") : undefined) || null;
+				const attachments = collectAttachmentParts(msg?.payload).map((att) => ({
+					filename: att.filename,
+					size: att.size,
+					mime_type: att.mimeType,
+				}));
+
+				rawItems.push({
+					draft_id: draft.id || stub.id,
+					message_id: msg?.id || null,
+					thread_id: msg?.threadId || null,
+					date: formatIsoDate(internalDateMs, headerDate),
+					internal_date_ms: internalDateMs,
+					to,
+					cc,
+					subject,
+					normalized_subject: normalizeSubjectForThreadComparison(subject || undefined),
+					attachments,
+					sent_candidates: [],
+				});
+
+				if (rawItems.length >= maxResults) break;
+			}
+
+			pageToken = listResp.data.nextPageToken || undefined;
+			if (!pageToken) break;
+		}
+
+		if (checkSent && rawItems.length > 0) {
+			const threadCache = new Map<string, GmailThread | null>();
+			const sentQueryCache = new Map<string, GmailMessage[]>();
+			const messageCache = new Map<string, GmailMessage | null>();
+
+			const fetchThread = async (threadId: string): Promise<GmailThread | null> => {
+				if (threadCache.has(threadId)) return threadCache.get(threadId) ?? null;
+				try {
+					const resp = await gmail.users.threads.get({
+						userId: "me",
+						id: threadId,
+						format: "metadata",
+						metadataHeaders: ["From", "To", "Cc", "Subject", "Date"],
+					});
+					const thread: GmailThread = resp.data;
+					threadCache.set(threadId, thread);
+					return thread;
+				} catch {
+					threadCache.set(threadId, null);
+					return null;
+				}
+			};
+
+			const fetchMessageMetadata = async (messageId: string): Promise<GmailMessage | null> => {
+				if (messageCache.has(messageId)) return messageCache.get(messageId) ?? null;
+				try {
+					const resp = await gmail.users.messages.get({
+						userId: "me",
+						id: messageId,
+						format: "metadata",
+						metadataHeaders: ["From", "To", "Cc", "Subject", "Date"],
+					});
+					const message: GmailMessage = resp.data;
+					messageCache.set(messageId, message);
+					return message;
+				} catch {
+					messageCache.set(messageId, null);
+					return null;
+				}
+			};
+
+			const searchSentMessages = async (query: string): Promise<GmailMessage[]> => {
+				if (sentQueryCache.has(query)) return sentQueryCache.get(query) || [];
+				const resp = await gmail.users.messages.list({
+					userId: "me",
+					q: query,
+					maxResults: 10,
+				});
+				const stubs: GmailMessage[] = resp.data.messages || [];
+				const messages: GmailMessage[] = [];
+				for (const stub of stubs) {
+					if (!stub.id) continue;
+					const msg = await fetchMessageMetadata(stub.id);
+					if (msg && isSentMessage(msg)) {
+						messages.push(msg);
+					}
+				}
+				sentQueryCache.set(query, messages);
+				return messages;
+			};
+
+			for (const item of rawItems) {
+				const candidatesById = new Map<string, SentDuplicateCandidate>();
+
+				if (item.thread_id) {
+					const thread = await fetchThread(item.thread_id);
+					const threadMessages = thread?.messages || [];
+
+					let latestInboundMs: number | null = null;
+					for (const msg of threadMessages) {
+						if (!msg.id || isDraftMessage(msg) || isSentMessage(msg)) continue;
+						const ms = parseMessageDateMs(msg.internalDate, this.getHeaderValue(msg, "date"));
+						if (ms !== null && (latestInboundMs === null || ms > latestInboundMs)) {
+							latestInboundMs = ms;
+						}
+					}
+
+					for (const msg of threadMessages) {
+						if (!msg.id || !isSentMessage(msg)) continue;
+						const headerDate = this.getHeaderValue(msg, "date");
+						const sentMs = parseMessageDateMs(msg.internalDate, headerDate);
+						const { to, cc } = parseRecipientsHeaders(
+							this.getHeaderValue(msg, "to"),
+							this.getHeaderValue(msg, "cc"),
+						);
+						const isEarlierBeforeInbound =
+							latestInboundMs !== null &&
+							sentMs !== null &&
+							latestInboundMs > sentMs &&
+							(item.internal_date_ms === null || item.internal_date_ms > sentMs);
+						const matchKind: SentMatchKind = isEarlierBeforeInbound
+							? "same_thread_earlier_sent"
+							: "same_thread_sent";
+
+						candidatesById.set(msg.id, {
+							message_id: msg.id,
+							thread_id: msg.threadId || item.thread_id,
+							date: formatIsoDate(sentMs, headerDate),
+							internal_date_ms: sentMs,
+							to,
+							cc,
+							subject: this.getHeaderValue(msg, "subject") || null,
+							match_kind: matchKind,
+						});
+					}
+				}
+
+				const query = buildSentSearchQuery(item.normalized_subject, [...item.to, ...item.cc]);
+				if (query) {
+					const sentMessages = await searchSentMessages(query);
+					for (const msg of sentMessages) {
+						if (!msg.id || candidatesById.has(msg.id)) continue;
+						const headerDate = this.getHeaderValue(msg, "date");
+						const sentMs = parseMessageDateMs(msg.internalDate, headerDate);
+						const sentSubject = this.getHeaderValue(msg, "subject") || null;
+						const sentNormalizedSubject = normalizeSubjectForThreadComparison(sentSubject || undefined);
+						const { to, cc } = parseRecipientsHeaders(
+							this.getHeaderValue(msg, "to"),
+							this.getHeaderValue(msg, "cc"),
+						);
+
+						const subjectMatches =
+							Boolean(item.normalized_subject) &&
+							Boolean(sentNormalizedSubject) &&
+							item.normalized_subject === sentNormalizedSubject;
+						const recipientOverlaps = hasOverlappingRecipients([...item.to, ...item.cc], [...to, ...cc]);
+
+						if (subjectMatches && recipientOverlaps) {
+							candidatesById.set(msg.id, {
+								message_id: msg.id,
+								thread_id: msg.threadId || null,
+								date: formatIsoDate(sentMs, headerDate),
+								internal_date_ms: sentMs,
+								to,
+								cc,
+								subject: sentSubject,
+								match_kind: "subject_and_recipient",
+							});
+						} else if (subjectMatches) {
+							candidatesById.set(msg.id, {
+								message_id: msg.id,
+								thread_id: msg.threadId || null,
+								date: formatIsoDate(sentMs, headerDate),
+								internal_date_ms: sentMs,
+								to,
+								cc,
+								subject: sentSubject,
+								match_kind: "subject_only",
+							});
+						}
+					}
+				}
+
+				item.sent_candidates = [...candidatesById.values()].sort(
+					(a, b) => (b.internal_date_ms ?? -1) - (a.internal_date_ms ?? -1),
+				);
+			}
+		}
+
+		const drafts = classifyDraftAuditItems(rawItems, checkSent);
+		return {
+			account: email,
+			older_than: parsedOlderThan.raw,
+			check_sent: checkSent,
+			read_only: true,
+			verification_note: THREAD_VERIFICATION_NOTE,
+			summary: summarizeDraftAudit(drafts),
+			drafts,
+		};
 	}
 
 	async listLabels(email: string): Promise<Array<{ id: string; name: string; type: string }>> {

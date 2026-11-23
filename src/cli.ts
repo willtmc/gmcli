@@ -2,6 +2,7 @@
 
 import * as fs from "fs";
 import { parseArgs } from "util";
+import { formatDraftAuditMarkdown, formatDraftAuditTable } from "./drafts-audit.js";
 import { GmailService, collectAttachmentParts, isDraftMessage } from "./gmail-service.js";
 import { consumeJsonFlag, parseMailbox, parseMailboxList } from "./json-format.js";
 
@@ -45,6 +46,9 @@ GMAIL COMMANDS
       Get thread with all messages.
       Shows: Message-ID, headers, body, attachments.
       --download saves attachments to ~/.gmcli/attachments/
+      Note: 'gmcli thread' alone is not sufficient send verification because
+      drafts can render inline in a thread like sent messages. Verify sent
+      status with 'drafts audit --check-sent' or an 'in:sent' search.
 
   gmcli <email> labels list
       List all labels with ID, name, and type.
@@ -57,6 +61,23 @@ GMAIL COMMANDS
 
   gmcli <email> drafts list
       List all drafts. Returns: draft ID, message ID.
+
+  gmcli <email> drafts audit [--older-than 1d] [--check-sent] [--max N|-m N]
+                             [--format markdown|table] [--json]
+      Read-only audit of stale drafts (never sends or deletes mail).
+      --older-than <dur>  Age filter: e.g. 1d (default), 12h, 2w, 1m, or all
+      --check-sent        Check thread SENT messages and in:sent by normalized
+                          subject + recipient for likely sent duplicates
+      --max, -m <N>       Maximum stale drafts to audit (default: 50)
+      --format <fmt>      Output format: markdown (default, Gavel-ready) or table
+      --json              Emit machine-readable JSON audit report
+      Classifications:
+        likely_duplicate_sent           Matching sent message in thread or subject+recipient
+        conflicting_obsolete_candidate  Older of multiple drafts for same thread/subject+recipient
+        not_proven_duplicate            Checked sent mail; no matching sent duplicate found
+        needs_human_decision            Unchecked, missing subject/recipients, or ambiguous match
+      Note: 'gmcli thread' alone is not sufficient send verification because
+      drafts can render inline like sent messages.
 
   gmcli <email> drafts get <draftId> [--download]
       View draft with attachments.
@@ -96,6 +117,7 @@ GMAIL COMMANDS
       Short aliases:
         search: --max/-m, --page/-p
         labels: --add/-a, --remove/-r
+        drafts audit: --max/-m
 
   gmcli <email> url <threadIds...>
       Generate Gmail web URLs for threads.
@@ -111,6 +133,7 @@ EXAMPLES
   gmcli you@gmail.com labels list
   gmcli you@gmail.com labels abc123 --add Work --remove UNREAD
   gmcli you@gmail.com drafts create --to a@x.com --subject "Hi" --body "Hello"
+  gmcli you@gmail.com drafts audit --older-than=1d --check-sent
   gmcli you@gmail.com drafts send r1234567890
   gmcli you@gmail.com send --to a@x.com --subject "Hi" --body "Hello"
   gmcli you@gmail.com send --to a@x.com --subject "Re: Topic" \\
@@ -500,6 +523,49 @@ async function handleDrafts(account: string, args: string[]) {
 				for (const d of drafts) {
 					console.log(`${d.id}\t${d.message?.id || ""}`);
 				}
+			}
+			break;
+		}
+		case "audit": {
+			const { values } = parseArgs({
+				args: rest,
+				options: {
+					"older-than": { type: "string" },
+					"check-sent": { type: "boolean" },
+					max: { type: "string", short: "m" },
+					format: { type: "string" },
+				},
+			});
+
+			const format = (values.format || "markdown").toLowerCase();
+			if (format !== "markdown" && format !== "table") {
+				error(`Invalid --format '${values.format}'. Expected 'markdown' or 'table'.`);
+			}
+
+			let maxResults = 50;
+			if (values.max !== undefined) {
+				const parsedMax = Number(values.max);
+				if (!Number.isInteger(parsedMax) || parsedMax <= 0) {
+					error(`Invalid --max value '${values.max}'. Expected a positive integer.`);
+				}
+				maxResults = parsedMax;
+			}
+
+			const result = await service.auditDrafts(account, {
+				olderThan: values["older-than"] ?? "1d",
+				checkSent: Boolean(values["check-sent"]),
+				maxResults,
+			});
+
+			if (jsonOutput) {
+				emitJson({ ok: true, ...result });
+				break;
+			}
+
+			if (format === "table") {
+				console.log(formatDraftAuditTable(result));
+			} else {
+				console.log(formatDraftAuditMarkdown(result));
 			}
 			break;
 		}
