@@ -97,6 +97,23 @@ export function isDraftMessage(message: Pick<GmailMessage, "labelIds"> | null | 
 	return message?.labelIds?.includes("DRAFT") || false;
 }
 
+export function selectLatestReplyMessage(messages: GmailMessage[] | null | undefined): GmailMessage | undefined {
+	if (!messages || messages.length === 0) return undefined;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const candidate = messages[i];
+		if (candidate?.id && !isDraftMessage(candidate)) {
+			return candidate;
+		}
+	}
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const candidate = messages[i];
+		if (candidate?.id) {
+			return candidate;
+		}
+	}
+	return undefined;
+}
+
 export function normalizeSubjectForThreadComparison(subject: string | undefined): string {
 	return (subject || "")
 		.trim()
@@ -449,6 +466,118 @@ export class GmailService {
 		return labels.map((l) => nameToId.get(l.toLowerCase()) || l);
 	}
 
+	private async resolveReplyTarget(
+		gmail: any,
+		replyToId: string,
+	): Promise<{ message: GmailMessage; threadId?: string }> {
+		const fetchMetadata = async (id: string): Promise<GmailMessage> => {
+			const response = await gmail.users.messages.get({
+				userId: "me",
+				id,
+				format: "metadata",
+				metadataHeaders: ["Message-ID", "References", "Subject"],
+			});
+			return response.data;
+		};
+
+		const resolveFromThread = async (
+			threadId: string,
+		): Promise<{ message: GmailMessage; threadId: string } | null> => {
+			const thread = await gmail.users.threads.get({
+				userId: "me",
+				id: threadId,
+				format: "minimal",
+			});
+			const latest = selectLatestReplyMessage(thread.data.messages);
+			if (!latest?.id) return null;
+			const message = await fetchMetadata(latest.id);
+			return {
+				message,
+				threadId: message.threadId || thread.data.id || threadId,
+			};
+		};
+
+		try {
+			const directMessage = await fetchMetadata(replyToId);
+			const directThreadId = directMessage.threadId || undefined;
+
+			// In Gmail, a thread's ID equals its root message's ID. When the caller
+			// passes a thread ID to --reply-to, messages.get succeeds with the root
+			// message. Resolve the thread so we reply to its latest non-draft message.
+			if (directThreadId && directThreadId === replyToId && gmail.users.threads?.get) {
+				try {
+					const thread = await gmail.users.threads.get({
+						userId: "me",
+						id: replyToId,
+						format: "minimal",
+					});
+					const latest = selectLatestReplyMessage(thread.data.messages);
+					if (latest?.id && latest.id !== replyToId) {
+						const latestMessage = await fetchMetadata(latest.id);
+						return {
+							message: latestMessage,
+							threadId: latestMessage.threadId || thread.data.id || directThreadId,
+						};
+					}
+					return {
+						message: directMessage,
+						threadId: directThreadId || thread.data.id || replyToId,
+					};
+				} catch {
+					// Fall back to the directly fetched message if thread lookup fails.
+				}
+			}
+
+			return {
+				message: directMessage,
+				threadId: directThreadId,
+			};
+		} catch {
+			const resolved = await resolveFromThread(replyToId);
+			if (!resolved) {
+				throw new Error(`Thread '${replyToId}' has no messages to reply to`);
+			}
+			return resolved;
+		}
+	}
+
+	private async resolveReplyMetadata(
+		gmail: any,
+		subject: string,
+		options: { threadId?: string; replyToMessageId?: string },
+	): Promise<{
+		inReplyTo?: string;
+		references?: string;
+		threadId?: string;
+		subject: string;
+	}> {
+		let inReplyTo: string | undefined;
+		let references: string | undefined;
+		let threadId = options.threadId;
+		let messageSubject = subject;
+
+		if (options.replyToMessageId) {
+			const replyTarget = await this.resolveReplyTarget(gmail, options.replyToMessageId);
+			const messageId = this.getHeaderValue(replyTarget.message, "Message-ID")?.trim();
+			const existingRefs = this.getHeaderValue(replyTarget.message, "References")?.trim();
+			const sourceSubject = this.getHeaderValue(replyTarget.message, "Subject");
+			messageSubject = canonicalReplySubject(messageSubject, sourceSubject);
+
+			if (messageId) {
+				inReplyTo = messageId;
+				if (!existingRefs) {
+					references = messageId;
+				} else {
+					const refTokens = existingRefs.split(/\s+/);
+					references = refTokens.includes(messageId) ? existingRefs : `${existingRefs} ${messageId}`;
+				}
+			}
+			threadId = threadId || replyTarget.threadId;
+		}
+
+		return { inReplyTo, references, threadId, subject: messageSubject };
+	}
+
 	async createDraft(
 		email: string,
 		to: string[],
@@ -465,52 +594,12 @@ export class GmailService {
 	): Promise<GmailDraft> {
 		const gmail = this.getGmailClient(email);
 
-		let inReplyTo: string | undefined;
-		let references: string | undefined;
-		let threadId = options.threadId;
-		let messageSubject = subject;
-
-		// If replying to a specific message, fetch its headers
-		if (options.replyToMessageId) {
-			let messageIdToFetch = options.replyToMessageId;
-
-			// Try to get as a message first; if that fails, treat as thread ID
-			try {
-				await gmail.users.messages.get({
-					userId: "me",
-					id: messageIdToFetch,
-					format: "minimal",
-				});
-			} catch {
-				// Probably a thread ID - get the thread and use the last message
-				const thread = await gmail.users.threads.get({
-					userId: "me",
-					id: options.replyToMessageId,
-					format: "minimal",
-				});
-				if (thread.data.messages && thread.data.messages.length > 0) {
-					messageIdToFetch = thread.data.messages[thread.data.messages.length - 1].id!;
-				}
-			}
-
-			const msg = await gmail.users.messages.get({
-				userId: "me",
-				id: messageIdToFetch,
-				format: "metadata",
-				metadataHeaders: ["Message-ID", "References", "Subject"],
-			});
-			const headers = msg.data.payload?.headers || [];
-			const messageId = headers.find((h: any) => h.name === "Message-ID")?.value;
-			const existingRefs = headers.find((h: any) => h.name === "References")?.value;
-			const sourceSubject = headers.find((h: any) => h.name?.toLowerCase() === "subject")?.value;
-			messageSubject = canonicalReplySubject(messageSubject, sourceSubject);
-
-			if (messageId) {
-				inReplyTo = messageId;
-				references = existingRefs ? `${existingRefs} ${messageId}` : messageId;
-			}
-			threadId = threadId || msg.data.threadId;
-		}
+		const {
+			inReplyTo,
+			references,
+			threadId,
+			subject: messageSubject,
+		} = await this.resolveReplyMetadata(gmail, subject, options);
 
 		const hasAttachments = options.attachments && options.attachments.length > 0;
 		const boundary = `boundary_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -653,52 +742,12 @@ export class GmailService {
 	): Promise<GmailMessage> {
 		const gmail = this.getGmailClient(email);
 
-		let inReplyTo: string | undefined;
-		let references: string | undefined;
-		let threadId: string | undefined = options.threadId;
-		let messageSubject = subject;
-
-		// If replying to a specific message, fetch its headers
-		if (options.replyToMessageId) {
-			let messageIdToFetch = options.replyToMessageId;
-
-			// Try to get as a message first; if that fails, treat as thread ID
-			try {
-				await gmail.users.messages.get({
-					userId: "me",
-					id: messageIdToFetch,
-					format: "minimal",
-				});
-			} catch {
-				// Probably a thread ID - get the thread and use the last message
-				const thread = await gmail.users.threads.get({
-					userId: "me",
-					id: options.replyToMessageId,
-					format: "minimal",
-				});
-				if (thread.data.messages && thread.data.messages.length > 0) {
-					messageIdToFetch = thread.data.messages[thread.data.messages.length - 1].id!;
-				}
-			}
-
-			const msg = await gmail.users.messages.get({
-				userId: "me",
-				id: messageIdToFetch,
-				format: "metadata",
-				metadataHeaders: ["Message-ID", "References", "Subject"],
-			});
-			const headers = msg.data.payload?.headers || [];
-			const messageId = headers.find((h: any) => h.name === "Message-ID")?.value;
-			const existingRefs = headers.find((h: any) => h.name === "References")?.value;
-			const sourceSubject = headers.find((h: any) => h.name?.toLowerCase() === "subject")?.value;
-			messageSubject = canonicalReplySubject(messageSubject, sourceSubject);
-
-			if (messageId) {
-				inReplyTo = messageId;
-				references = existingRefs ? `${existingRefs} ${messageId}` : messageId;
-			}
-			threadId = threadId || msg.data.threadId || undefined;
-		}
+		const {
+			inReplyTo,
+			references,
+			threadId,
+			subject: messageSubject,
+		} = await this.resolveReplyMetadata(gmail, subject, options);
 
 		const hasAttachments = options.attachments && options.attachments.length > 0;
 		const boundary = `boundary_${Date.now()}_${Math.random().toString(36).slice(2)}`;
