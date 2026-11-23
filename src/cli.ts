@@ -8,7 +8,7 @@ import { consumeJsonFlag, parseMailbox, parseMailboxList } from "./json-format.j
 const service = new GmailService();
 let jsonOutput = false;
 
-function usage(): never {
+function usage(exitCode = 1): never {
 	console.log(`gmcli - Gmail CLI
 
 USAGE
@@ -122,7 +122,7 @@ DATA STORAGE
   ~/.gmcli/credentials.json   OAuth client credentials
   ~/.gmcli/accounts.json      Account tokens
   ~/.gmcli/attachments/       Downloaded attachments`);
-	process.exit(1);
+	process.exit(exitCode);
 }
 
 function error(msg: string): never {
@@ -140,8 +140,11 @@ function emitJson(payload: Record<string, unknown>): void {
 
 async function main() {
 	const args = process.argv.slice(2);
-	if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
-		usage();
+	if (args.includes("--help") || args.includes("-h")) {
+		usage(0);
+	}
+	if (args.length === 0) {
+		usage(1);
 	}
 
 	const first = args[0];
