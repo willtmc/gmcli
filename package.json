@@ -19,6 +19,7 @@
 		"build": "tsc && chmod +x dist/cli.js",
 		"check": "biome check src/ --write --diagnostic-level=error && tsgo --noEmit",
 		"test": "npm run build && node --test test/**/*.test.js",
+		"install-local": "bash scripts/install-local.sh",
 		"prepublishOnly": "npm run build",
 		"prepare": "husky"
 	},
