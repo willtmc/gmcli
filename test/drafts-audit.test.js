@@ -539,13 +539,7 @@ test("formatDraftAuditMarkdown handles empty audit cleanly", () => {
 });
 
 test("CLI --help documents drafts audit, short aliases, and thread verification caveat", () => {
-	let output = "";
-	try {
-		execFileSync(process.execPath, [CLI_PATH, "--help"], { encoding: "utf8" });
-	} catch (err) {
-		// usage() prints to stdout and exits with status 1
-		output = err.stdout || "";
-	}
+	const output = execFileSync(process.execPath, [CLI_PATH, "--help"], { encoding: "utf8" });
 	assert.match(output, /drafts audit \[--older-than 1d\] \[--check-sent\]/);
 	assert.match(output, /drafts audit: --max\/-m/);
 	assert.match(output, /gmcli thread.*not sufficient send verification/i);
