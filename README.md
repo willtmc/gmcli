@@ -78,6 +78,8 @@ gmcli you@gmail.com search "from:someone@example.com has:attachment"
 
 Get a thread with all messages. Shows Message-ID, headers, body, and attachments for each message.
 
+> **Send verification note:** `gmcli thread` alone is not sufficient send verification because Gmail threads can include `DRAFT` messages inline alongside sent messages. Use `gmcli <email> drafts audit --check-sent` or an explicit `in:sent` search to verify whether a message was actually sent.
+
 ```bash
 gmcli <email> thread <threadId>              # View thread
 gmcli <email> thread <threadId> --download   # Download attachments
@@ -108,6 +110,8 @@ gmcli you@gmail.com labels abc123 def456 --add STARRED
 
 ```bash
 gmcli <email> drafts list                      # List all drafts
+gmcli <email> drafts audit [--older-than 1d] [--check-sent] [--max N|-m N] [--format markdown|table] [--json]
+                                               # Read-only stale draft audit with sent-duplicate evidence
 gmcli <email> drafts get <draftId>             # View draft with attachments
 gmcli <email> drafts get <draftId> --download  # Download draft attachments
 gmcli <email> drafts delete <draftId>          # Delete draft
@@ -115,6 +119,8 @@ gmcli <email> drafts send <draftId>            # Send draft
 
 gmcli <email> drafts create --to <emails> --subject <s> --body <b> [options]
 ```
+
+`drafts audit` is strictly read-only (never sends or deletes mail) and classifies each stale draft as `likely_duplicate_sent`, `conflicting_obsolete_candidate`, `not_proven_duplicate`, or `needs_human_decision`. Default `--format markdown` produces a table ready to paste into a task note.
 
 ### send
 
