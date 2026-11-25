@@ -149,6 +149,69 @@ export function canonicalReplySubject(requestedSubject: string, sourceSubject: s
 }
 
 export const MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+export const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
+export const DEFAULT_CONCURRENCY = 5;
+export const METADATA_HEADERS = ["From", "To", "Cc", "Subject", "Date"];
+
+export const GMAIL_CLIENT_RETRY_CONFIG = {
+	retry: 3,
+	retryDelay: 250,
+	retryDelayMultiplier: 2,
+	maxRetryDelay: 10_000,
+	noResponseRetries: 2,
+	// Only retry idempotent HTTP methods; never auto-retry POST (sends/draft creates)
+	// so transient errors cannot produce duplicate outbound emails.
+	httpMethodsToRetry: ["GET", "HEAD", "OPTIONS", "PUT", "DELETE"],
+	statusCodesToRetry: [
+		[429, 429],
+		[500, 599],
+	],
+};
+
+export async function mapWithConcurrency<T, R>(
+	items: readonly T[],
+	concurrency: number,
+	worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+	if (items.length === 0) return [];
+	const limit = Math.max(1, Math.min(Math.floor(concurrency), items.length));
+	const results = new Array<R>(items.length);
+	let nextIndex = 0;
+	let failed = false;
+
+	const runWorker = async (): Promise<void> => {
+		while (!failed) {
+			const currentIndex = nextIndex++;
+			if (currentIndex >= items.length) return;
+			try {
+				results[currentIndex] = await worker(items[currentIndex], currentIndex);
+			} catch (err) {
+				failed = true;
+				throw err;
+			}
+		}
+	};
+
+	await Promise.all(Array.from({ length: limit }, () => runWorker()));
+	return results;
+}
+
+export function isGmailNotFoundError(error: unknown): boolean {
+	if (!error || typeof error !== "object") return false;
+	const err = error as {
+		code?: unknown;
+		status?: unknown;
+		response?: { status?: unknown; data?: { error?: { code?: unknown } } };
+	};
+	return (
+		err.code === 404 ||
+		err.code === "404" ||
+		err.status === 404 ||
+		err.response?.status === 404 ||
+		err.response?.data?.error?.code === 404
+	);
+}
+
 const MIME_ENCODED_WORD_PREFIX = "=?UTF-8?B?";
 const MIME_ENCODED_WORD_SUFFIX = "?=";
 // 39 raw UTF-8 bytes => 52 base64 chars => 64-char encoded-word (<= 75 per RFC 2047,
@@ -441,13 +504,30 @@ export class GmailService {
 				);
 			}
 
-			const oauth2Client = new OAuth2Client(clientId, clientSecret, "http://localhost");
+			const oauth2Client = new OAuth2Client({
+				clientId,
+				clientSecret,
+				redirectUri: "http://localhost",
+				transporterOptions: {
+					timeout: DEFAULT_HTTP_TIMEOUT_MS,
+				},
+			});
 
 			oauth2Client.setCredentials({
 				refresh_token: account.oauth2.refreshToken,
 			});
 
-			const gmail = google.gmail({ version: "v1", auth: oauth2Client });
+			const gmail = google.gmail({
+				version: "v1",
+				auth: oauth2Client,
+				timeout: DEFAULT_HTTP_TIMEOUT_MS,
+				retry: true,
+				retryConfig: {
+					...GMAIL_CLIENT_RETRY_CONFIG,
+					httpMethodsToRetry: [...GMAIL_CLIENT_RETRY_CONFIG.httpMethodsToRetry],
+					statusCodesToRetry: GMAIL_CLIENT_RETRY_CONFIG.statusCodesToRetry.map((range) => [...range]),
+				},
+			});
 			this.gmailClients.set(email, gmail);
 		}
 
@@ -463,13 +543,17 @@ export class GmailService {
 			pageToken,
 		});
 
-		const threads = response.data.threads || [];
-		const detailedThreads: GmailThread[] = [];
-
-		for (const thread of threads) {
-			const detail = (await this.getThread(email, thread.id, false)) as GmailThread;
-			detailedThreads.push(detail);
-		}
+		const rawThreads: GmailThread[] = response.data.threads || [];
+		const threads = rawThreads.filter((thread): thread is GmailThread & { id: string } => Boolean(thread.id));
+		const detailedThreads = await mapWithConcurrency(threads, DEFAULT_CONCURRENCY, async (thread) => {
+			const detailResp = await gmail.users.threads.get({
+				userId: "me",
+				id: thread.id,
+				format: "metadata",
+				metadataHeaders: METADATA_HEADERS,
+			});
+			return detailResp.data as GmailThread;
+		});
 
 		return {
 			threads: detailedThreads.map((thread) => ({
@@ -542,6 +626,7 @@ export class GmailService {
 				inlineData: att.inlineData,
 				filename: att.filename,
 				partPath: att.partPath,
+				size: att.size,
 			})),
 		);
 
@@ -580,6 +665,7 @@ export class GmailService {
 			inlineData?: string;
 			filename: string;
 			partPath: string;
+			size?: number;
 		}>,
 	): Promise<AttachmentDownloadResult[]> {
 		const gmail = this.getGmailClient(email);
@@ -622,18 +708,15 @@ export class GmailService {
 					throw new Error("Attachment has no attachmentId or inline data");
 				}
 
-				if (fs.existsSync(filePath)) {
-					const existingSize = fs.statSync(filePath).size;
-					const attachmentInfo = await gmail.users.messages.attachments.get({
-						userId: "me",
-						messageId: attachment.messageId,
-						id: attachment.attachmentId,
-					});
-
-					if (existingSize === attachmentInfo.data.size) {
-						results.push({ success: true, filename: attachment.filename, path: filePath, cached: true });
-						continue;
-					}
+				const existingSize = fs.existsSync(filePath) ? fs.statSync(filePath).size : null;
+				if (
+					existingSize !== null &&
+					typeof attachment.size === "number" &&
+					attachment.size > 0 &&
+					existingSize === attachment.size
+				) {
+					results.push({ success: true, filename: attachment.filename, path: filePath, cached: true });
+					continue;
 				}
 
 				const response = await gmail.users.messages.attachments.get({
@@ -642,7 +725,12 @@ export class GmailService {
 					id: attachment.attachmentId,
 				});
 
-				const data = Buffer.from(response.data.data, "base64url");
+				const data = Buffer.from(response.data.data || "", "base64url");
+				if (existingSize !== null && existingSize === data.length) {
+					results.push({ success: true, filename: attachment.filename, path: filePath, cached: true });
+					continue;
+				}
+
 				fs.writeFileSync(filePath, data, { mode: 0o600 });
 				fs.chmodSync(filePath, 0o600);
 
@@ -666,22 +754,24 @@ export class GmailService {
 		removeLabels: string[] = [],
 	): Promise<LabelOperationResult[]> {
 		const gmail = this.getGmailClient(email);
+		const normalizedAdd = [...new Set(addLabels.map((l) => l.trim()).filter(Boolean))];
+		const normalizedRemove = [...new Set(removeLabels.map((l) => l.trim()).filter(Boolean))];
 		const results: LabelOperationResult[] = [];
 
 		for (const threadId of threadIds) {
 			try {
-				if (addLabels.length > 0) {
+				if (normalizedAdd.length > 0 || normalizedRemove.length > 0) {
+					const requestBody: gmail_v1.Schema$ModifyThreadRequest = {};
+					if (normalizedAdd.length > 0) {
+						requestBody.addLabelIds = normalizedAdd;
+					}
+					if (normalizedRemove.length > 0) {
+						requestBody.removeLabelIds = normalizedRemove;
+					}
 					await gmail.users.threads.modify({
 						userId: "me",
 						id: threadId,
-						requestBody: { addLabelIds: addLabels },
-					});
-				}
-				if (removeLabels.length > 0) {
-					await gmail.users.threads.modify({
-						userId: "me",
-						id: threadId,
-						requestBody: { removeLabelIds: removeLabels },
+						requestBody,
 					});
 				}
 				results.push({ threadId, success: true });
@@ -732,14 +822,19 @@ export class GmailService {
 			const draftStubs: GmailDraft[] = listResp.data.drafts || [];
 			if (draftStubs.length === 0) break;
 
-			for (const stub of draftStubs) {
-				if (!stub.id) continue;
+			const validStubs = draftStubs.filter((stub): stub is GmailDraft & { id: string } => Boolean(stub.id));
+			const stubsToFetch =
+				parsedOlderThan.cutoffMs === null ? validStubs.slice(0, maxResults - rawItems.length) : validStubs;
+			const fetchedDrafts = await mapWithConcurrency(stubsToFetch, DEFAULT_CONCURRENCY, async (stub) => {
 				const draftResp = await gmail.users.drafts.get({
 					userId: "me",
 					id: stub.id,
 					format: "full",
 				});
-				const draft: GmailDraft = draftResp.data;
+				return { stub, draft: draftResp.data as GmailDraft };
+			});
+
+			for (const { stub, draft } of fetchedDrafts) {
 				const msg = draft.message;
 				const headerDate = msg ? this.getHeaderValue(msg, "date") : undefined;
 				const internalDateMs = parseMessageDateMs(msg?.internalDate, headerDate);
@@ -785,67 +880,84 @@ export class GmailService {
 		}
 
 		if (checkSent && rawItems.length > 0) {
-			const threadCache = new Map<string, GmailThread | null>();
-			const sentQueryCache = new Map<string, GmailMessage[]>();
-			const messageCache = new Map<string, GmailMessage | null>();
+			const threadCache = new Map<string, Promise<GmailThread | null>>();
+			const sentQueryCache = new Map<string, Promise<GmailMessage[]>>();
+			const messageCache = new Map<string, Promise<GmailMessage | null>>();
 
-			const fetchThread = async (threadId: string): Promise<GmailThread | null> => {
-				if (threadCache.has(threadId)) return threadCache.get(threadId) ?? null;
-				try {
-					const resp = await gmail.users.threads.get({
-						userId: "me",
-						id: threadId,
-						format: "metadata",
-						metadataHeaders: ["From", "To", "Cc", "Subject", "Date"],
-					});
-					const thread: GmailThread = resp.data;
-					threadCache.set(threadId, thread);
-					return thread;
-				} catch {
-					threadCache.set(threadId, null);
-					return null;
-				}
-			};
-
-			const fetchMessageMetadata = async (messageId: string): Promise<GmailMessage | null> => {
-				if (messageCache.has(messageId)) return messageCache.get(messageId) ?? null;
-				try {
-					const resp = await gmail.users.messages.get({
-						userId: "me",
-						id: messageId,
-						format: "metadata",
-						metadataHeaders: ["From", "To", "Cc", "Subject", "Date"],
-					});
-					const message: GmailMessage = resp.data;
-					messageCache.set(messageId, message);
-					return message;
-				} catch {
-					messageCache.set(messageId, null);
-					return null;
-				}
-			};
-
-			const searchSentMessages = async (query: string): Promise<GmailMessage[]> => {
-				if (sentQueryCache.has(query)) return sentQueryCache.get(query) || [];
-				const resp = await gmail.users.messages.list({
-					userId: "me",
-					q: query,
-					maxResults: 10,
-				});
-				const stubs: GmailMessage[] = resp.data.messages || [];
-				const messages: GmailMessage[] = [];
-				for (const stub of stubs) {
-					if (!stub.id) continue;
-					const msg = await fetchMessageMetadata(stub.id);
-					if (msg && isSentMessage(msg)) {
-						messages.push(msg);
+			const fetchThread = (threadId: string): Promise<GmailThread | null> => {
+				const cached = threadCache.get(threadId);
+				if (cached) return cached;
+				const pending = (async (): Promise<GmailThread | null> => {
+					try {
+						const resp = await gmail.users.threads.get({
+							userId: "me",
+							id: threadId,
+							format: "metadata",
+							metadataHeaders: METADATA_HEADERS,
+						});
+						return resp.data as GmailThread;
+					} catch (err) {
+						if (isGmailNotFoundError(err)) {
+							return null;
+						}
+						threadCache.delete(threadId);
+						throw err;
 					}
-				}
-				sentQueryCache.set(query, messages);
-				return messages;
+				})();
+				threadCache.set(threadId, pending);
+				return pending;
 			};
 
-			for (const item of rawItems) {
+			const fetchMessageMetadata = (messageId: string): Promise<GmailMessage | null> => {
+				const cached = messageCache.get(messageId);
+				if (cached) return cached;
+				const pending = (async (): Promise<GmailMessage | null> => {
+					try {
+						const resp = await gmail.users.messages.get({
+							userId: "me",
+							id: messageId,
+							format: "metadata",
+							metadataHeaders: METADATA_HEADERS,
+						});
+						return resp.data as GmailMessage;
+					} catch (err) {
+						if (isGmailNotFoundError(err)) {
+							return null;
+						}
+						messageCache.delete(messageId);
+						throw err;
+					}
+				})();
+				messageCache.set(messageId, pending);
+				return pending;
+			};
+
+			const searchSentMessages = (query: string): Promise<GmailMessage[]> => {
+				const cached = sentQueryCache.get(query);
+				if (cached) return cached;
+				const pending = (async (): Promise<GmailMessage[]> => {
+					try {
+						const resp = await gmail.users.messages.list({
+							userId: "me",
+							q: query,
+							maxResults: 10,
+						});
+						const rawStubs: GmailMessage[] = resp.data.messages || [];
+						const stubs = rawStubs.filter((stub): stub is GmailMessage & { id: string } => Boolean(stub.id));
+						const fetched = await mapWithConcurrency(stubs, DEFAULT_CONCURRENCY, (stub) =>
+							fetchMessageMetadata(stub.id),
+						);
+						return fetched.filter((msg): msg is GmailMessage => Boolean(msg && isSentMessage(msg)));
+					} catch (err) {
+						sentQueryCache.delete(query);
+						throw err;
+					}
+				})();
+				sentQueryCache.set(query, pending);
+				return pending;
+			};
+
+			await mapWithConcurrency(rawItems, DEFAULT_CONCURRENCY, async (item) => {
 				const candidatesById = new Map<string, SentDuplicateCandidate>();
 
 				if (item.thread_id) {
@@ -940,7 +1052,7 @@ export class GmailService {
 				item.sent_candidates = [...candidatesById.values()].sort(
 					(a, b) => (b.internal_date_ms ?? -1) - (a.internal_date_ms ?? -1),
 				);
-			}
+			});
 		}
 
 		const drafts = classifyDraftAuditItems(rawItems, checkSent);
@@ -977,7 +1089,14 @@ export class GmailService {
 	}
 
 	resolveLabelIds(labels: string[], nameToId: Map<string, string>): string[] {
-		return labels.map((l) => nameToId.get(l.toLowerCase()) || l);
+		return [
+			...new Set(
+				labels
+					.map((l) => l.trim())
+					.filter(Boolean)
+					.map((l) => nameToId.get(l.toLowerCase()) || l),
+			),
+		];
 	}
 
 	private async resolveReplyTarget(

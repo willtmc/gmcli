@@ -103,6 +103,246 @@ test("buildSentSearchQuery uses normalized subject and primary recipient", () =>
 	assert.equal(buildSentSearchQuery("", []), null);
 });
 
+test("buildSentSearchQuery matches multiple To/Cc recipients with OR and caps at 5 unique emails", () => {
+	assert.equal(
+		buildSentSearchQuery("settlement update", [
+			{ name: "Alice", email: "alice@example.com" },
+			{ name: "Bob", email: "BOB@example.com" },
+			{ name: "Alice Dup", email: "alice@example.com" },
+		]),
+		'in:sent subject:"settlement update" (to:alice@example.com OR to:bob@example.com)',
+	);
+
+	const sevenRecipients = Array.from({ length: 7 }, (_, i) => ({
+		name: `User ${i + 1}`,
+		email: `user${i + 1}@example.com`,
+	}));
+	assert.equal(
+		buildSentSearchQuery("group notice", sevenRecipients),
+		'in:sent subject:"group notice" (to:user1@example.com OR to:user2@example.com OR to:user3@example.com OR to:user4@example.com OR to:user5@example.com)',
+	);
+});
+
+test("auditDrafts finds sent duplicate sent to a CC recipient via multi-recipient search", async () => {
+	const twoDaysAgo = String(NOW_MS - 2 * DAY_MS);
+	const queries = [];
+	const { gmail } = makeFakeGmail({
+		draftsList: [{ id: "r-cc-dup" }],
+		draftsById: {
+			"r-cc-dup": {
+				id: "r-cc-dup",
+				message: {
+					id: "m-cc-draft",
+					threadId: "t-cc-draft",
+					internalDate: twoDaysAgo,
+					labelIds: ["DRAFT"],
+					payload: {
+						headers: [
+							{ name: "To", value: "primary@example.com" },
+							{ name: "Cc", value: "secondary@example.com" },
+							{ name: "Subject", value: "Closing docs" },
+						],
+					},
+				},
+			},
+		},
+		threadsById: {
+			"t-cc-draft": {
+				id: "t-cc-draft",
+				messages: [{ id: "m-cc-draft", threadId: "t-cc-draft", labelIds: ["DRAFT"], internalDate: twoDaysAgo }],
+			},
+		},
+		sentSearch: (q) => {
+			queries.push(q);
+			if (q.includes("to:secondary@example.com")) {
+				return [{ id: "m-sent-to-cc" }];
+			}
+			return [];
+		},
+		messagesById: {
+			"m-sent-to-cc": {
+				id: "m-sent-to-cc",
+				threadId: "t-sent-separate",
+				labelIds: ["SENT"],
+				internalDate: String(NOW_MS - 1.5 * DAY_MS),
+				payload: {
+					headers: [
+						{ name: "To", value: "secondary@example.com" },
+						{ name: "Subject", value: "Closing docs" },
+					],
+				},
+			},
+		},
+	});
+
+	const service = new GmailService();
+	service.gmailClients.set("will@mclemoreauction.com", gmail);
+	const result = await service.auditDrafts("will@mclemoreauction.com", {
+		olderThan: "1d",
+		checkSent: true,
+		nowMs: NOW_MS,
+	});
+
+	assert.equal(queries.length, 1);
+	assert.equal(queries[0], 'in:sent subject:"closing docs" (to:primary@example.com OR to:secondary@example.com)');
+	assert.equal(result.drafts[0].disposition, "likely_duplicate_sent");
+	assert.equal(result.drafts[0].sent_candidates[0].message_id, "m-sent-to-cc");
+	assert.equal(result.drafts[0].sent_candidates[0].match_kind, "subject_and_recipient");
+});
+
+test("auditDrafts returns null on 404 thread/message lookups but propagates 401 and 429 errors", async () => {
+	const twoDaysAgo = String(NOW_MS - 2 * DAY_MS);
+	const baseDraft = {
+		id: "r-err",
+		message: {
+			id: "m-err",
+			threadId: "t-err",
+			internalDate: twoDaysAgo,
+			labelIds: ["DRAFT"],
+			payload: {
+				headers: [
+					{ name: "To", value: "client@example.com" },
+					{ name: "Subject", value: "Status update" },
+				],
+			},
+		},
+	};
+
+	// Genuine 404 on threads.get and messages.get is handled gracefully
+	const notFoundErr = Object.assign(new Error("Not Found"), { code: 404, response: { status: 404 } });
+	const { gmail: gmail404 } = makeFakeGmail({
+		draftsList: [{ id: "r-err" }],
+		draftsById: { "r-err": baseDraft },
+		sentSearch: () => [{ id: "m-vanished" }],
+	});
+	gmail404.users.threads.get = async () => {
+		throw notFoundErr;
+	};
+	gmail404.users.messages.get = async () => {
+		throw notFoundErr;
+	};
+
+	const svc404 = new GmailService();
+	svc404.gmailClients.set("will@mclemoreauction.com", gmail404);
+	const res404 = await svc404.auditDrafts("will@mclemoreauction.com", {
+		olderThan: "1d",
+		checkSent: true,
+		nowMs: NOW_MS,
+	});
+	assert.equal(res404.drafts.length, 1);
+	assert.equal(res404.drafts[0].disposition, "not_proven_duplicate");
+
+	// 401 on threads.get must propagate, NEVER silently produce not_proven_duplicate
+	const authErr = Object.assign(new Error("Invalid Credentials"), { code: 401, response: { status: 401 } });
+	const { gmail: gmail401 } = makeFakeGmail({
+		draftsList: [{ id: "r-err" }],
+		draftsById: { "r-err": baseDraft },
+	});
+	gmail401.users.threads.get = async () => {
+		throw authErr;
+	};
+	const svc401 = new GmailService();
+	svc401.gmailClients.set("will@mclemoreauction.com", gmail401);
+	await assert.rejects(
+		() => svc401.auditDrafts("will@mclemoreauction.com", { olderThan: "1d", checkSent: true, nowMs: NOW_MS }),
+		/Invalid Credentials/,
+	);
+
+	// 429 on messages.get must propagate, NEVER silently produce not_proven_duplicate
+	const rateLimitErr = Object.assign(new Error("Rate Limit Exceeded"), { status: 429, response: { status: 429 } });
+	const { gmail: gmail429 } = makeFakeGmail({
+		draftsList: [{ id: "r-err" }],
+		draftsById: { "r-err": baseDraft },
+		threadsById: {
+			"t-err": { id: "t-err", messages: [{ id: "m-err", threadId: "t-err", labelIds: ["DRAFT"] }] },
+		},
+		sentSearch: () => [{ id: "m-sent-1" }],
+	});
+	gmail429.users.messages.get = async () => {
+		throw rateLimitErr;
+	};
+	const svc429 = new GmailService();
+	svc429.gmailClients.set("will@mclemoreauction.com", gmail429);
+	await assert.rejects(
+		() => svc429.auditDrafts("will@mclemoreauction.com", { olderThan: "1d", checkSent: true, nowMs: NOW_MS }),
+		/Rate Limit Exceeded/,
+	);
+});
+
+test("auditDrafts fetches drafts and threads with bounded concurrency while preserving order", async () => {
+	const twoDaysAgo = String(NOW_MS - 2 * DAY_MS);
+	const count = 12;
+	const draftsList = Array.from({ length: count }, (_, i) => ({ id: `r-${i}` }));
+	const draftsById = {};
+	const threadsById = {};
+	for (let i = 0; i < count; i++) {
+		draftsById[`r-${i}`] = {
+			id: `r-${i}`,
+			message: {
+				id: `m-${i}`,
+				threadId: `t-${i}`,
+				internalDate: twoDaysAgo,
+				labelIds: ["DRAFT"],
+				payload: {
+					headers: [
+						{ name: "To", value: `user${i}@example.com` },
+						{ name: "Subject", value: `Draft ${i}` },
+					],
+				},
+			},
+		};
+		threadsById[`t-${i}`] = {
+			id: `t-${i}`,
+			messages: [{ id: `m-${i}`, threadId: `t-${i}`, labelIds: ["DRAFT"], internalDate: twoDaysAgo }],
+		};
+	}
+
+	let draftInFlight = 0;
+	let maxDraftInFlight = 0;
+	let threadInFlight = 0;
+	let maxThreadInFlight = 0;
+
+	const { gmail } = makeFakeGmail({ draftsList, draftsById, threadsById });
+	const origDraftGet = gmail.users.drafts.get;
+	gmail.users.drafts.get = async (params) => {
+		draftInFlight++;
+		maxDraftInFlight = Math.max(maxDraftInFlight, draftInFlight);
+		await new Promise((r) => setTimeout(r, 15 - (Number(params.id.slice(2)) % 5) * 2));
+		try {
+			return await origDraftGet(params);
+		} finally {
+			draftInFlight--;
+		}
+	};
+	const origThreadGet = gmail.users.threads.get;
+	gmail.users.threads.get = async (params) => {
+		threadInFlight++;
+		maxThreadInFlight = Math.max(maxThreadInFlight, threadInFlight);
+		await new Promise((r) => setTimeout(r, 15 - (Number(params.id.slice(2)) % 5) * 2));
+		try {
+			return await origThreadGet(params);
+		} finally {
+			threadInFlight--;
+		}
+	};
+
+	const service = new GmailService();
+	service.gmailClients.set("will@mclemoreauction.com", gmail);
+	const result = await service.auditDrafts("will@mclemoreauction.com", {
+		olderThan: "1d",
+		checkSent: true,
+		nowMs: NOW_MS,
+	});
+
+	assert.equal(result.drafts.length, count);
+	assert.deepEqual(
+		result.drafts.map((d) => d.draft_id),
+		draftsList.map((d) => d.id),
+	);
+	assert.ok(maxDraftInFlight >= 2 && maxDraftInFlight <= 5, `Expected 2..5 concurrent draft fetches, got ${maxDraftInFlight}`);
+	assert.ok(maxThreadInFlight >= 2 && maxThreadInFlight <= 5, `Expected 2..5 concurrent thread fetches, got ${maxThreadInFlight}`);
+});
+
 test("auditDrafts classifies all 4 dispositions, extracts attachments, and makes zero mutating calls", async () => {
 	const twoDaysAgo = String(NOW_MS - 2 * DAY_MS);
 	const threeDaysAgo = String(NOW_MS - 3 * DAY_MS);
