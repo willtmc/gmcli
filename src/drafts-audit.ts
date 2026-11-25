@@ -129,8 +129,10 @@ export function hasOverlappingRecipients(a: Mailbox[], b: Mailbox[]): boolean {
 	return false;
 }
 
+const MAX_SENT_SEARCH_RECIPIENTS = 5;
+
 export function buildSentSearchQuery(normalizedSubject: string, recipients: Mailbox[]): string | null {
-	const emails = extractEmailAddresses(recipients);
+	const emails = extractEmailAddresses(recipients).slice(0, MAX_SENT_SEARCH_RECIPIENTS);
 	const cleanSubject = normalizedSubject.replace(/"/g, " ").replace(/\s+/g, " ").trim();
 	if (!cleanSubject && emails.length === 0) return null;
 
@@ -138,8 +140,10 @@ export function buildSentSearchQuery(normalizedSubject: string, recipients: Mail
 	if (cleanSubject) {
 		parts.push(`subject:"${cleanSubject}"`);
 	}
-	if (emails.length > 0) {
+	if (emails.length === 1) {
 		parts.push(`to:${emails[0]}`);
+	} else if (emails.length > 1) {
+		parts.push(`(${emails.map((email) => `to:${email}`).join(" OR ")})`);
 	}
 	return parts.join(" ");
 }
