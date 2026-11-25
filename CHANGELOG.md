@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `gmcli --version` / `-v` flag reading version from `package.json` (with `--json` support).
+- Unified `--json` output across all remaining commands: `labels <threadIds>`, `drafts get --download`, `drafts create`, `drafts delete`, `drafts send`, `send`, and `accounts list|add|remove|credentials`.
+- `drafts audit` read-only stale-draft auditor with `--check-sent` duplicate detection, markdown/table/JSON outputs, and short alias `-m` (#17).
+- Canonical `npm run install-local` script to rebuild, install globally, and verify the `gmcli` binary on `PATH` (#16).
+- Help and `parseArgs` short-alias parity tests (#15) and CLI ergonomics test suite.
+
+### Changed
+- Strict `parseArgs` parsing across all commands (`accounts`, `thread`, `drafts get/delete/send`, `url`, `search`, `labels`, `drafts create`, `send`); unknown flags fail cleanly instead of being silently ignored or treated as positional IDs.
+- Shared compose argument parser for `drafts create` and `send`: rejects specifying both `--body` and `--body-file` together and reports the exact missing required option (`--to`, `--subject`, `--body` or `--body-file`).
+- Error usage (`usage(1)`) now writes to `stderr`, while explicit `--help` / `-h` writes to `stdout`.
+- `thread` output now displays `Gmail-Message-ID:` separately from RFC 822 `Message-ID:` and includes `Cc:` when present.
+- `search` now summarizes each thread using its latest message for sender/date and the union of labels across all messages in the thread, validates `--max` as a positive integer, guards malformed `Date` headers, and sanitizes control/tab characters in TSV columns.
+- CI now runs tests and non-mutating lint/typecheck checks; cleaned Biome and `package.json` config (#18).
+- Refreshed `--help` output and `README.md` for `--json`, `--version`, `--body-file`, `--html`, short aliases, and env-first Doppler credentials.
+
+### Fixed
+- Stopped global `-h` / `--help` and `--json` scanning from hijacking option values (e.g., `--subject "foo --json"` or `--body=-h`).
+- `labels <threadIds>` now exits `1` if neither `--add` nor `--remove` is provided or if any thread modification fails (printing errors to `stderr` in text mode or structured `results`/`errors` in `--json` mode).
+- `accounts remove <email>` now exits `1` when the account is not found.
+- `decodeBody` now skips named attachments and non-`text/*` MIME parts so inline binary attachments are never dumped as message text.
+- `formatSize` now clamps unit indexes so sizes >= 1 TB never format as `undefined`.
+- `parseMailboxList` now respects quoted display names containing commas (e.g. `"McLemore, Will" <will@mclemoreauction.com>, jane@example.com`).
+- `drafts create --reply-to` now preserves the Gmail thread when given a `threadId` (#14).
+
+### Security
+- Hardened MIME header/body encoding, inbound/outbound attachment path validation, OAuth CSRF state and HTML error escaping, and `0700`/`0600` atomic token storage (#19).
+
 ## 0.5.0
 
 ### Added
