@@ -1,5 +1,5 @@
 {
-	"$schema": "https://biomejs.dev/schemas/2.3.5/schema.json",
+	"$schema": "https://biomejs.dev/schemas/1.9.4/schema.json",
 	"linter": {
 		"enabled": true,
 		"rules": {
@@ -11,7 +11,7 @@
 				"useTemplate": "off"
 			},
 			"correctness": {
-				"noUnusedVariables": "off"
+				"noUnusedVariables": "error"
 			},
 			"suspicious": {
 				"noExplicitAny": "off",
