@@ -1,11 +1,8 @@
+import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import type { EmailAccount } from "./types.js";
-
-const CONFIG_DIR = path.join(os.homedir(), ".gmcli");
-const ACCOUNTS_FILE = path.join(CONFIG_DIR, "accounts.json");
-const CREDENTIALS_FILE = path.join(CONFIG_DIR, "credentials.json");
 
 // Strip OAuth-app credentials (clientId/clientSecret) from a stored account.
 // Those values must come from env (Doppler) at runtime, not at-rest on disk.
@@ -15,35 +12,92 @@ function sanitizeForStorage(account: EmailAccount): EmailAccount {
 }
 
 export class AccountStorage {
+	private readonly configDir: string;
+	private readonly accountsFile: string;
+	private readonly credentialsFile: string;
 	private accounts: Map<string, EmailAccount> = new Map();
 
-	constructor() {
+	constructor(configDir?: string) {
+		this.configDir = configDir || path.join(os.homedir(), ".gmcli");
+		this.accountsFile = path.join(this.configDir, "accounts.json");
+		this.credentialsFile = path.join(this.configDir, "credentials.json");
 		this.ensureConfigDir();
 		this.loadAccounts();
 	}
 
 	private ensureConfigDir(): void {
-		if (!fs.existsSync(CONFIG_DIR)) {
-			fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+		if (!fs.existsSync(this.configDir)) {
+			fs.mkdirSync(this.configDir, { recursive: true, mode: 0o700 });
 		}
+		fs.chmodSync(this.configDir, 0o700);
 	}
 
 	private loadAccounts(): void {
-		if (fs.existsSync(ACCOUNTS_FILE)) {
+		let raw: string;
+		try {
+			raw = fs.readFileSync(this.accountsFile, "utf8");
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+				return;
+			}
+			throw new Error(
+				`Failed to read accounts file '${this.accountsFile}': ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(raw);
+		} catch (err) {
+			throw new Error(
+				`Failed to parse accounts file '${this.accountsFile}' as JSON (${err instanceof Error ? err.message : String(err)}). ` +
+					"Fix or back up and remove the corrupted file before modifying accounts.",
+			);
+		}
+
+		if (!Array.isArray(parsed)) {
+			throw new Error(
+				`Invalid accounts file '${this.accountsFile}': expected a JSON array of accounts. ` +
+					"Fix or back up and remove the corrupted file before modifying accounts.",
+			);
+		}
+
+		for (const account of parsed) {
+			if (!account || typeof account !== "object" || typeof (account as EmailAccount).email !== "string") {
+				throw new Error(
+					`Invalid account entry in '${this.accountsFile}'. ` +
+						"Fix or back up and remove the corrupted file before modifying accounts.",
+				);
+			}
+			this.accounts.set((account as EmailAccount).email, account as EmailAccount);
+		}
+	}
+
+	private writeJsonFileAtomic(targetFile: string, data: unknown): void {
+		this.ensureConfigDir();
+		const tmpFile = path.join(
+			this.configDir,
+			`.${path.basename(targetFile)}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`,
+		);
+		try {
+			fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), { mode: 0o600 });
+			fs.chmodSync(tmpFile, 0o600);
+			fs.renameSync(tmpFile, targetFile);
+		} catch (err) {
 			try {
-				const data = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf8"));
-				for (const account of data) {
-					this.accounts.set(account.email, account);
+				if (fs.existsSync(tmpFile)) {
+					fs.unlinkSync(tmpFile);
 				}
 			} catch {
-				// Ignore
+				// Ignore cleanup errors
 			}
+			throw err;
 		}
 	}
 
 	private saveAccounts(): void {
 		const sanitized = Array.from(this.accounts.values()).map(sanitizeForStorage);
-		fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(sanitized, null, 2), { mode: 0o600 });
+		this.writeJsonFileAtomic(this.accountsFile, sanitized);
 	}
 
 	addAccount(account: EmailAccount): void {
@@ -70,7 +124,7 @@ export class AccountStorage {
 	}
 
 	setCredentials(clientId: string, clientSecret: string): void {
-		fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify({ clientId, clientSecret }, null, 2), { mode: 0o600 });
+		this.writeJsonFileAtomic(this.credentialsFile, { clientId, clientSecret });
 	}
 
 	getCredentials(): { clientId: string; clientSecret: string } | null {
@@ -79,9 +133,9 @@ export class AccountStorage {
 		if (envId && envSecret) {
 			return { clientId: envId, clientSecret: envSecret };
 		}
-		if (!fs.existsSync(CREDENTIALS_FILE)) return null;
+		if (!fs.existsSync(this.credentialsFile)) return null;
 		try {
-			return JSON.parse(fs.readFileSync(CREDENTIALS_FILE, "utf8"));
+			return JSON.parse(fs.readFileSync(this.credentialsFile, "utf8"));
 		} catch {
 			return null;
 		}
