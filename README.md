@@ -2,7 +2,7 @@
 
 Minimal Gmail CLI for searching, reading threads, managing labels, drafts, and sending emails.
 
-> **Fork Notice:** This is a fork of [@mariozechner/gmcli](https://github.com/badlogic/gmcli) by Mario Zechner with bug fixes for `--reply-to` thread ID handling and `drafts send` crash. See [CHANGELOG.md](CHANGELOG.md) for details.
+> **Fork Notice:** This is a fork of [@mariozechner/gmcli](https://github.com/badlogic/gmcli) by Mario Zechner with bug fixes, `--json` support across all commands, stale-draft auditing, and security hardening. See [CHANGELOG.md](CHANGELOG.md) for details.
 
 ## Install
 
@@ -33,7 +33,16 @@ Before adding an account, you need OAuth2 credentials from Google Cloud Console:
    - Application type: "Desktop app"
    - Download the JSON file
 
-Then:
+### Env-first credentials (recommended, e.g. Doppler)
+
+`gmcli` checks `GMCLI_CLIENT_ID` and `GMCLI_CLIENT_SECRET` in the environment before falling back to `~/.gmcli/credentials.json`. You can inject them at runtime without storing OAuth client secrets on disk:
+
+```bash
+doppler run -- gmcli accounts add you@gmail.com
+doppler run -- gmcli you@gmail.com search "in:inbox"
+```
+
+### File-based credentials (fallback)
 
 ```bash
 gmcli accounts credentials ~/path/to/credentials.json
@@ -43,29 +52,44 @@ gmcli accounts add you@gmail.com
 ## Usage
 
 ```
-gmcli accounts <action>                Account management
+gmcli accounts <action> [options]      Account management
 gmcli <email> <command> [options]      Gmail operations
+gmcli --help | -h                      Show help
+gmcli --version | -v                   Show version
 ```
+
+### Global options & short aliases
+
+- `--json` — Supported on all commands (`accounts`, `search`, `thread`, `labels`, `drafts`, `send`, `url`). Emits a single JSON object with `"ok": true` on success or `{"ok": false, "error": "..."}` on failure.
+- `--help`, `-h` — Show usage on stdout and exit `0`. Usage errors print to stderr and exit `1`.
+- `--version`, `-v` — Print the installed `gmcli` version (supports `--json`).
+- Short aliases:
+  - Global: `--help`/`-h`, `--version`/`-v`
+  - `search`: `--max`/`-m`, `--page`/`-p`
+  - `labels`: `--add`/`-a`, `--remove`/`-r`
+  - `drafts audit`: `--max`/`-m`
 
 ## Commands
 
 ### accounts
 
 ```bash
-gmcli accounts credentials <file.json>   # Set OAuth credentials (once)
-gmcli accounts list                      # List configured accounts
-gmcli accounts add <email>               # Add account (opens browser)
-gmcli accounts add <email> --manual      # Add account (browserless, paste redirect URL)
-gmcli accounts remove <email>            # Remove account
+gmcli accounts credentials <file.json> [--json]   # Set fallback OAuth credentials (once)
+gmcli accounts list [--json]                      # List configured accounts
+gmcli accounts add <email> [--json]               # Add account (opens browser)
+gmcli accounts add <email> --manual [--json]      # Add account (browserless, paste redirect URL)
+gmcli accounts remove <email> [--json]            # Remove account (exits 1 if not found)
 ```
 
 ### search
 
-Search threads using Gmail query syntax. Returns thread ID, date, sender, subject, and labels.
+Search threads using Gmail query syntax. Returns thread ID, latest message date and sender, subject, and the union of thread labels.
 
 ```bash
-gmcli <email> search <query> [--max N] [--page TOKEN]
+gmcli <email> search <query> [--max N|-m N] [--page TOKEN|-p TOKEN] [--json]
 ```
+
+`--max` / `-m` must be a positive integer (default: `10`).
 
 Query examples:
 - `in:inbox`, `in:sent`, `in:drafts`, `in:trash`, `in:spam`
@@ -80,19 +104,19 @@ Query examples:
 Examples:
 ```bash
 gmcli you@gmail.com search "in:inbox"
-gmcli you@gmail.com search "is:unread" --max 50
+gmcli you@gmail.com search "is:unread" -m 50 --json
 gmcli you@gmail.com search "from:someone@example.com has:attachment"
 ```
 
 ### thread
 
-Get a thread with all messages. Shows Message-ID, headers, body, and attachments for each message.
+Get a thread with all messages. Shows `Gmail-Message-ID`, RFC 822 `Message-ID`, headers (including `Cc`), body, and attachments for each message.
 
 > **Send verification note:** `gmcli thread` alone is not sufficient send verification because Gmail threads can include `DRAFT` messages inline alongside sent messages. Use `gmcli <email> drafts audit --check-sent` or an explicit `in:sent` search to verify whether a message was actually sent.
 
 ```bash
-gmcli <email> thread <threadId>              # View thread
-gmcli <email> thread <threadId> --download   # Download attachments
+gmcli <email> thread <threadId> [--json]              # View thread
+gmcli <email> thread <threadId> --download [--json]   # Download attachments
 ```
 
 Attachments are saved to `~/.gmcli/attachments/`.
@@ -100,34 +124,34 @@ Attachments are saved to `~/.gmcli/attachments/`.
 ### labels
 
 ```bash
-gmcli <email> labels list                              # List all labels (ID, name, type)
-gmcli <email> labels <threadIds...> [--add L] [--remove L]  # Modify labels on threads
+gmcli <email> labels list [--json]                                       # List all labels (ID, name, type)
+gmcli <email> labels <threadIds...> [--add L|-a L] [--remove L|-r L] [--json]  # Modify labels on threads
 ```
 
-You can use label names or IDs when modifying (names are case-insensitive).
+At least one of `--add` (`-a`) or `--remove` (`-r`) is required when modifying labels, and the command exits `1` if any thread fails. You can use label names or IDs (names are case-insensitive).
 
 System labels: `INBOX`, `UNREAD`, `STARRED`, `IMPORTANT`, `TRASH`, `SPAM`
 
 Examples:
 ```bash
-gmcli you@gmail.com labels list
-gmcli you@gmail.com labels abc123 --remove UNREAD
+gmcli you@gmail.com labels list --json
+gmcli you@gmail.com labels abc123 -r UNREAD
 gmcli you@gmail.com labels abc123 --add Work --remove INBOX
-gmcli you@gmail.com labels abc123 def456 --add STARRED
+gmcli you@gmail.com labels abc123 def456 -a STARRED --json
 ```
 
 ### drafts
 
 ```bash
-gmcli <email> drafts list                      # List all drafts
+gmcli <email> drafts list [--json]                      # List all drafts
 gmcli <email> drafts audit [--older-than 1d] [--check-sent] [--max N|-m N] [--format markdown|table] [--json]
-                                               # Read-only stale draft audit with sent-duplicate evidence
-gmcli <email> drafts get <draftId>             # View draft with attachments
-gmcli <email> drafts get <draftId> --download  # Download draft attachments
-gmcli <email> drafts delete <draftId>          # Delete draft
-gmcli <email> drafts send <draftId>            # Send draft
+                                                        # Read-only stale draft audit with sent-duplicate evidence
+gmcli <email> drafts get <draftId> [--json]             # View draft with attachments
+gmcli <email> drafts get <draftId> --download [--json]  # Download draft attachments
+gmcli <email> drafts delete <draftId> [--json]          # Delete draft
+gmcli <email> drafts send <draftId> [--json]            # Send draft
 
-gmcli <email> drafts create --to <emails> --subject <s> --body <b> [options]
+gmcli <email> drafts create --to <emails> --subject <s> (--body <b> | --body-file <path>) [options]
 ```
 
 `drafts audit` is strictly read-only (never sends or deletes mail) and classifies each stale draft as `likely_duplicate_sent`, `conflicting_obsolete_candidate`, `not_proven_duplicate`, or `needs_human_decision`. Default `--format markdown` produces a table ready to paste into a task note.
@@ -137,38 +161,45 @@ gmcli <email> drafts create --to <emails> --subject <s> --body <b> [options]
 Send an email directly.
 
 ```bash
-gmcli <email> send --to <emails> --subject <s> --body <b> [options]
+gmcli <email> send --to <emails> --subject <s> (--body <b> | --body-file <path>) [options]
 ```
 
 Options for `drafts create` and `send`:
 - `--to <emails>` - Recipients (comma-separated, required)
 - `--subject <s>` - Subject line (required)
-- `--body <b>` - Message body (required)
+- `--body <b>` - Message body (mutually exclusive with `--body-file`)
+- `--body-file <path>` - Read message body from a file (mutually exclusive with `--body`; recommended for multiline bodies)
+- `--html` - Send body as `text/html` instead of `text/plain`
 - `--cc <emails>` - CC recipients (comma-separated)
 - `--bcc <emails>` - BCC recipients (comma-separated)
 - `--reply-to <messageId>` - Reply to message (sets In-Reply-To/References headers and thread; accepts Gmail message ID or thread ID; canonicalizes equivalent reply subjects to Gmail's source thread subject)
 - `--in-reply-to <messageId>` - Alias for `--reply-to`
 - `--thread <threadId>` - Force a specific Gmail thread without setting reply headers; prefer `--reply-to` for normal replies
 - `--attach <file>` - Attach file (can be used multiple times)
+- `--json` - Emit machine-readable JSON response
 
 Examples:
 ```bash
 # Create draft
 gmcli you@gmail.com drafts create --to a@x.com --subject "Hi" --body "Hello"
 
+# Create HTML draft from file with JSON output
+gmcli you@gmail.com drafts create --to a@x.com --subject "Update" \
+    --body-file update.html --html --json
+
 # Create reply draft
 gmcli you@gmail.com drafts create --to a@x.com --subject "Re: Topic" \
     --body "My reply" --reply-to 19aea1f2f3532db5
 
 # Send draft
-gmcli you@gmail.com drafts send r1234567890
+gmcli you@gmail.com drafts send r1234567890 --json
 
 # Send directly
 gmcli you@gmail.com send --to a@x.com --subject "Hi" --body "Hello"
 
 # Send reply with attachment
 gmcli you@gmail.com send --to a@x.com --subject "Re: Topic" \
-    --body "See attached" --reply-to 19aea1f2f3532db5 --attach doc.pdf
+    --body-file reply.txt --reply-to 19aea1f2f3532db5 --attach doc.pdf
 ```
 
 ### url
@@ -176,20 +207,20 @@ gmcli you@gmail.com send --to a@x.com --subject "Re: Topic" \
 Generate Gmail web URLs for threads. Uses canonical URL format with email parameter (works regardless of account order in browser).
 
 ```bash
-gmcli <email> url <threadIds...>
+gmcli <email> url <threadIds...> [--json]
 ```
 
 Example:
 ```bash
-gmcli you@gmail.com url 19aea1f2f3532db5 19aea1f2f3532db6
+gmcli you@gmail.com url 19aea1f2f3532db5 19aea1f2f3532db6 --json
 ```
 
 ## Data Storage
 
-All data is stored in `~/.gmcli/`:
-- `credentials.json` - OAuth client credentials
-- `accounts.json` - Account tokens
-- `attachments/` - Downloaded attachments
+- `GMCLI_CLIENT_ID` / `GMCLI_CLIENT_SECRET` — Env-first OAuth client credentials (e.g. via `doppler run --`), checked before `~/.gmcli/credentials.json`
+- `~/.gmcli/credentials.json` — Fallback OAuth client credentials file (`0600`)
+- `~/.gmcli/accounts.json` — Account refresh tokens (`0600`)
+- `~/.gmcli/attachments/` — Downloaded attachments (`0700` dir, `0600` files)
 
 ## Development
 
