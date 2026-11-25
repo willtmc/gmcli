@@ -9,6 +9,5 @@ export interface EmailAccount {
 		clientId?: string;
 		clientSecret?: string;
 		refreshToken: string;
-		accessToken?: string;
 	};
 }

@@ -1,8 +1,8 @@
 import { spawn } from "child_process";
+import * as crypto from "crypto";
 import * as http from "http";
 import type { AddressInfo } from "net";
 import * as readline from "readline";
-import * as url from "url";
 import { OAuth2Client } from "google-auth-library";
 
 const SCOPES = ["https://mail.google.com/"];
@@ -14,13 +14,38 @@ interface AuthResult {
 	error?: string;
 }
 
+export function escapeHtml(value: string): string {
+	return value
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;")
+		.replace(/'/g, "&#39;");
+}
+
+export function verifyOAuthState(expectedState: string, receivedState: string | null | undefined): boolean {
+	if (!expectedState || !receivedState) return false;
+	const expectedBuf = Buffer.from(expectedState, "utf8");
+	const receivedBuf = Buffer.from(receivedState, "utf8");
+	if (expectedBuf.length !== receivedBuf.length) return false;
+	return crypto.timingSafeEqual(expectedBuf, receivedBuf);
+}
+
 export class GmailOAuthFlow {
+	private readonly clientId: string;
+	private readonly clientSecret: string;
 	private oauth2Client: OAuth2Client;
 	private server: http.Server | null = null;
 	private timeoutId: NodeJS.Timeout | null = null;
 
 	constructor(clientId: string, clientSecret: string) {
+		this.clientId = clientId;
+		this.clientSecret = clientSecret;
 		this.oauth2Client = new OAuth2Client(clientId, clientSecret);
+	}
+
+	protected createOAuth2Client(redirectUri: string): OAuth2Client {
+		return new OAuth2Client(this.clientId, this.clientSecret, redirectUri);
 	}
 
 	async authorize(manual = false): Promise<string> {
@@ -36,11 +61,14 @@ export class GmailOAuthFlow {
 
 	private async startManualFlow(): Promise<AuthResult> {
 		const redirectUri = "http://localhost:1";
-		this.oauth2Client = new OAuth2Client(this.oauth2Client._clientId, this.oauth2Client._clientSecret, redirectUri);
+		const expectedState = crypto.randomBytes(24).toString("hex");
+		this.oauth2Client = this.createOAuth2Client(redirectUri);
 
 		const authUrl = this.oauth2Client.generateAuthUrl({
 			access_type: "offline",
+			prompt: "consent",
 			scope: SCOPES,
+			state: expectedState,
 		});
 
 		console.log("Visit this URL to authorize:");
@@ -56,8 +84,17 @@ export class GmailOAuthFlow {
 			rl.question("Paste redirect URL: ", async (input) => {
 				rl.close();
 				try {
-					const parsed = url.parse(input, true);
-					const code = parsed.query.code as string;
+					const parsed = new URL(input.trim());
+					if (!verifyOAuthState(expectedState, parsed.searchParams.get("state"))) {
+						resolve({ success: false, error: "OAuth state mismatch" });
+						return;
+					}
+					const error = parsed.searchParams.get("error");
+					if (error) {
+						resolve({ success: false, error });
+						return;
+					}
+					const code = parsed.searchParams.get("code");
 					if (!code) {
 						resolve({ success: false, error: "No authorization code found in URL" });
 						return;
@@ -72,11 +109,13 @@ export class GmailOAuthFlow {
 	}
 
 	private startAuthFlow(): Promise<AuthResult> {
+		const expectedState = crypto.randomBytes(24).toString("hex");
+
 		return new Promise((resolve) => {
 			this.server = http.createServer((req, res) => {
-				const parsed = url.parse(req.url!, true);
+				const parsed = new URL(req.url || "/", "http://localhost");
 				if (parsed.pathname === "/") {
-					this.handleCallback(parsed.query, res, resolve);
+					void this.handleCallback(parsed.searchParams, expectedState, res, resolve);
 				} else {
 					res.writeHead(404);
 					res.end();
@@ -87,15 +126,13 @@ export class GmailOAuthFlow {
 				const port = (this.server!.address() as AddressInfo).port;
 				const redirectUri = `http://localhost:${port}`;
 
-				this.oauth2Client = new OAuth2Client(
-					this.oauth2Client._clientId,
-					this.oauth2Client._clientSecret,
-					redirectUri,
-				);
+				this.oauth2Client = this.createOAuth2Client(redirectUri);
 
 				const authUrl = this.oauth2Client.generateAuthUrl({
 					access_type: "offline",
+					prompt: "consent",
 					scope: SCOPES,
+					state: expectedState,
 				});
 
 				console.log("Opening browser for Gmail authorization...");
@@ -118,20 +155,34 @@ export class GmailOAuthFlow {
 	}
 
 	private async handleCallback(
-		query: any,
+		searchParams: URLSearchParams,
+		expectedState: string,
 		res: http.ServerResponse,
 		resolve: (result: AuthResult) => void,
 	): Promise<void> {
-		if (query.error) {
-			res.writeHead(200, { "Content-Type": "text/html" });
-			res.end("<html><body><h1>Authorization cancelled</h1></body></html>");
+		const receivedState = searchParams.get("state");
+		if (!verifyOAuthState(expectedState, receivedState)) {
+			res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+			res.end(
+				"<html><body><h1>Invalid OAuth state</h1><p>State verification failed. Please retry authorization.</p></body></html>",
+			);
 			this.cleanup();
-			resolve({ success: false, error: query.error });
+			resolve({ success: false, error: "OAuth state mismatch" });
 			return;
 		}
 
-		if (!query.code) {
-			res.writeHead(400, { "Content-Type": "text/html" });
+		const error = searchParams.get("error");
+		if (error) {
+			res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+			res.end(`<html><body><h1>Authorization cancelled</h1><p>${escapeHtml(error)}</p></body></html>`);
+			this.cleanup();
+			resolve({ success: false, error });
+			return;
+		}
+
+		const code = searchParams.get("code");
+		if (!code) {
+			res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
 			res.end("<html><body><h1>No authorization code</h1></body></html>");
 			this.cleanup();
 			resolve({ success: false, error: "No authorization code" });
@@ -139,16 +190,17 @@ export class GmailOAuthFlow {
 		}
 
 		try {
-			const { tokens } = await this.oauth2Client.getToken(query.code as string);
-			res.writeHead(200, { "Content-Type": "text/html" });
+			const { tokens } = await this.oauth2Client.getToken(code);
+			res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
 			res.end("<html><body><h1>Success!</h1><p>You can close this window.</p></body></html>");
 			this.cleanup();
 			resolve({ success: true, refreshToken: tokens.refresh_token || undefined });
 		} catch (e) {
-			res.writeHead(500, { "Content-Type": "text/html" });
-			res.end(`<html><body><h1>Error</h1><p>${e instanceof Error ? e.message : e}</p></body></html>`);
+			const message = e instanceof Error ? e.message : String(e);
+			res.writeHead(500, { "Content-Type": "text/html; charset=utf-8" });
+			res.end(`<html><body><h1>Error</h1><p>${escapeHtml(message)}</p></body></html>`);
 			this.cleanup();
-			resolve({ success: false, error: e instanceof Error ? e.message : String(e) });
+			resolve({ success: false, error: message });
 		}
 	}
 
@@ -163,8 +215,8 @@ export class GmailOAuthFlow {
 		}
 	}
 
-	private openBrowser(url: string): void {
+	private openBrowser(targetUrl: string): void {
 		const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-		spawn(cmd, [url], { detached: true, stdio: "ignore" });
+		spawn(cmd, [targetUrl], { detached: true, stdio: "ignore" });
 	}
 }

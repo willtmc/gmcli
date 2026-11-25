@@ -1,3 +1,4 @@
+import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -147,9 +148,226 @@ export function canonicalReplySubject(requestedSubject: string, sourceSubject: s
 		: requestedSubject;
 }
 
+export const MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const MIME_ENCODED_WORD_PREFIX = "=?UTF-8?B?";
+const MIME_ENCODED_WORD_SUFFIX = "?=";
+// 39 raw UTF-8 bytes => 52 base64 chars => 64-char encoded-word (<= 75 per RFC 2047,
+// and <= 76 even on the first line with "Subject: ").
+const MAX_ENCODED_WORD_UTF8_BYTES = 39;
+
+function assertNoCrlf(fieldName: string, value: string): void {
+	if (/[\r\n]/.test(value)) {
+		throw new Error(`Invalid ${fieldName}: must not contain CR or LF characters`);
+	}
+}
+
 export function encodeMimeHeader(value: string): string {
+	assertNoCrlf("header", value);
 	if (/^[\x20-\x7e]*$/.test(value)) return value;
-	return `=?UTF-8?B?${Buffer.from(value, "utf8").toString("base64")}?=`;
+
+	const words: string[] = [];
+	let chunk = "";
+	let chunkBytes = 0;
+
+	for (const char of value) {
+		const charBytes = Buffer.byteLength(char, "utf8");
+		if (chunk && chunkBytes + charBytes > MAX_ENCODED_WORD_UTF8_BYTES) {
+			words.push(
+				`${MIME_ENCODED_WORD_PREFIX}${Buffer.from(chunk, "utf8").toString("base64")}${MIME_ENCODED_WORD_SUFFIX}`,
+			);
+			chunk = char;
+			chunkBytes = charBytes;
+		} else {
+			chunk += char;
+			chunkBytes += charBytes;
+		}
+	}
+
+	if (chunk) {
+		words.push(
+			`${MIME_ENCODED_WORD_PREFIX}${Buffer.from(chunk, "utf8").toString("base64")}${MIME_ENCODED_WORD_SUFFIX}`,
+		);
+	}
+
+	return words.join("\r\n ");
+}
+
+export function sanitizeAttachmentHeaderFilename(filename: string): string {
+	const cleaned = filename
+		.replace(/[\r\n\0/]/g, "")
+		.trim()
+		.replace(/\\/g, "\\\\")
+		.replace(/"/g, '\\"');
+	return cleaned || "attachment";
+}
+
+export function sanitizeInboundFilename(rawFilename: string): string {
+	const normalized = rawFilename.replace(/\\/g, "/");
+	const base = path.posix
+		.basename(normalized)
+		.replace(/[\x00-\x1f\x7f]/g, "")
+		.trim()
+		.replace(/^\.+/, "");
+	return base || "attachment";
+}
+
+function wrapBase64(base64: string, lineLength = 76): string {
+	if (base64.length <= lineLength) return base64;
+	const lines: string[] = [];
+	for (let i = 0; i < base64.length; i += lineLength) {
+		lines.push(base64.slice(i, i + lineLength));
+	}
+	return lines.join("\r\n");
+}
+
+function getMimeType(filename: string): string {
+	const ext = path.extname(filename).toLowerCase();
+	const mimeTypes: Record<string, string> = {
+		".pdf": "application/pdf",
+		".doc": "application/msword",
+		".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		".xls": "application/vnd.ms-excel",
+		".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+		".png": "image/png",
+		".jpg": "image/jpeg",
+		".jpeg": "image/jpeg",
+		".gif": "image/gif",
+		".txt": "text/plain",
+		".html": "text/html",
+		".zip": "application/zip",
+		".json": "application/json",
+	};
+	return mimeTypes[ext] || "application/octet-stream";
+}
+
+export interface BuildRawMimeMessageInput {
+	from: string;
+	to: string[];
+	subject: string;
+	body: string;
+	cc?: string[];
+	bcc?: string[];
+	inReplyTo?: string;
+	references?: string;
+	attachments?: string[];
+	html?: boolean;
+}
+
+export function validateAttachmentPaths(attachments: string[]): Array<{ filePath: string; size: number }> {
+	let totalBytes = 0;
+	const validated: Array<{ filePath: string; size: number }> = [];
+
+	for (const filePath of attachments) {
+		assertNoCrlf("attachment filename", path.basename(filePath));
+		let stat: fs.Stats;
+		try {
+			stat = fs.statSync(filePath);
+		} catch (e) {
+			const code = (e as NodeJS.ErrnoException)?.code;
+			if (code === "ENOENT") {
+				throw new Error(`Attachment file not found: ${filePath}`);
+			}
+			throw new Error(`Cannot read attachment '${filePath}': ${e instanceof Error ? e.message : String(e)}`);
+		}
+		if (!stat.isFile()) {
+			throw new Error(`Attachment path is not a regular file: ${filePath}`);
+		}
+		totalBytes += stat.size;
+		if (totalBytes > MAX_TOTAL_ATTACHMENT_BYTES) {
+			throw new Error(
+				`Total attachment size (${totalBytes} bytes) exceeds Gmail's 25 MB limit (${MAX_TOTAL_ATTACHMENT_BYTES} bytes)`,
+			);
+		}
+		validated.push({ filePath, size: stat.size });
+	}
+
+	return validated;
+}
+
+export function buildRawMimeMessage(input: BuildRawMimeMessageInput): string {
+	assertNoCrlf("From header", input.from);
+	for (const recipient of input.to) {
+		assertNoCrlf("To header", recipient);
+	}
+	for (const recipient of input.cc || []) {
+		assertNoCrlf("Cc header", recipient);
+	}
+	for (const recipient of input.bcc || []) {
+		assertNoCrlf("Bcc header", recipient);
+	}
+	assertNoCrlf("Subject header", input.subject);
+	if (input.inReplyTo) {
+		assertNoCrlf("In-Reply-To header", input.inReplyTo);
+	}
+	if (input.references) {
+		assertNoCrlf("References header", input.references);
+	}
+
+	const attachments = input.attachments || [];
+	const hasAttachments = attachments.length > 0;
+	if (hasAttachments) {
+		validateAttachmentPaths(attachments);
+	}
+
+	const boundary = `boundary_${crypto.randomBytes(16).toString("hex")}`;
+	const contentType = input.html ? "text/html" : "text/plain";
+	const encodedBody = wrapBase64(Buffer.from(input.body, "utf8").toString("base64"));
+
+	const headers = [
+		`From: ${input.from}`,
+		`To: ${input.to.join(", ")}`,
+		input.cc?.length ? `Cc: ${input.cc.join(", ")}` : "",
+		input.bcc?.length ? `Bcc: ${input.bcc.join(", ")}` : "",
+		`Subject: ${encodeMimeHeader(input.subject)}`,
+		input.inReplyTo ? `In-Reply-To: ${input.inReplyTo}` : "",
+		input.references ? `References: ${input.references}` : "",
+		"MIME-Version: 1.0",
+		hasAttachments
+			? `Content-Type: multipart/mixed; boundary="${boundary}"`
+			: `Content-Type: ${contentType}; charset=UTF-8`,
+		hasAttachments ? "" : "Content-Transfer-Encoding: base64",
+	].filter(Boolean);
+
+	if (!hasAttachments) {
+		return `${headers.join("\r\n")}\r\n\r\n${encodedBody}`;
+	}
+
+	const parts: string[] = [];
+	parts.push(
+		`--${boundary}\r\n` +
+			`Content-Type: ${contentType}; charset=UTF-8\r\n` +
+			"Content-Transfer-Encoding: base64\r\n\r\n" +
+			encodedBody,
+	);
+
+	let actualTotalBytes = 0;
+	for (const filePath of attachments) {
+		const rawFilename = path.basename(filePath);
+		assertNoCrlf("attachment filename", rawFilename);
+		const safeFilename = sanitizeAttachmentHeaderFilename(rawFilename);
+		assertNoCrlf("attachment filename", safeFilename);
+
+		const fileContent = fs.readFileSync(filePath);
+		actualTotalBytes += fileContent.length;
+		if (actualTotalBytes > MAX_TOTAL_ATTACHMENT_BYTES) {
+			throw new Error(
+				`Total attachment size (${actualTotalBytes} bytes) exceeds Gmail's 25 MB limit (${MAX_TOTAL_ATTACHMENT_BYTES} bytes)`,
+			);
+		}
+
+		const base64Content = wrapBase64(fileContent.toString("base64"));
+		const mimeType = getMimeType(rawFilename);
+
+		parts.push(
+			`--${boundary}\r\n` +
+				`Content-Type: ${mimeType}\r\n` +
+				"Content-Transfer-Encoding: base64\r\n" +
+				`Content-Disposition: attachment; filename="${safeFilename}"\r\n\r\n` +
+				base64Content,
+		);
+	}
+
+	return `${headers.join("\r\n")}\r\n\r\n${parts.join("\r\n")}\r\n--${boundary}--`;
 }
 
 export interface LabelOperationResult {
@@ -159,8 +377,15 @@ export interface LabelOperationResult {
 }
 
 export class GmailService {
-	private accountStorage = new AccountStorage();
+	private accountStorage: AccountStorage;
+	private attachmentDir: string;
 	private gmailClients: Map<string, any> = new Map();
+
+	constructor(options: { configDir?: string; attachmentDir?: string } = {}) {
+		this.accountStorage = new AccountStorage(options.configDir);
+		this.attachmentDir =
+			options.attachmentDir || path.join(options.configDir || path.join(os.homedir(), ".gmcli"), "attachments");
+	}
 
 	async addGmailAccount(email: string, clientId: string, clientSecret: string, manual = false): Promise<void> {
 		if (this.accountStorage.hasAccount(email)) {
@@ -220,7 +445,6 @@ export class GmailService {
 
 			oauth2Client.setCredentials({
 				refresh_token: account.oauth2.refreshToken,
-				access_token: account.oauth2.accessToken,
 			});
 
 			const gmail = google.gmail({ version: "v1", auth: oauth2Client });
@@ -286,7 +510,15 @@ export class GmailService {
 			return thread;
 		}
 
-		const attachmentMetadata: AttachmentDownloadTarget[] = (thread.messages || []).flatMap((message: GmailMessage) =>
+		return this.downloadPartsForMessages(email, thread.messages || [], `thread ${threadId}`);
+	}
+
+	private async downloadPartsForMessages(
+		email: string,
+		messages: GmailMessage[],
+		contextLabel: string,
+	): Promise<DownloadedAttachment[]> {
+		const attachmentMetadata: AttachmentDownloadTarget[] = messages.flatMap((message: GmailMessage) =>
 			collectAttachmentParts(message.payload).map((part: AttachmentPartInfo) => ({
 				messageId: message.id!,
 				filename: part.filename,
@@ -333,7 +565,7 @@ export class GmailService {
 
 		if (attachmentMetadata.length > 0 && downloadedAttachments.length === 0) {
 			console.error(
-				`[gmcli] Warning: attachment metadata listed ${attachmentMetadata.length} attachment(s), but none were downloaded for thread ${threadId}.`,
+				`[gmcli] Warning: attachment metadata listed ${attachmentMetadata.length} attachment(s), but none were downloaded for ${contextLabel}.`,
 			);
 		}
 
@@ -353,17 +585,25 @@ export class GmailService {
 		const gmail = this.getGmailClient(email);
 		const results: AttachmentDownloadResult[] = [];
 
-		const attachmentDir = path.join(os.homedir(), ".gmcli", "attachments");
-		if (!fs.existsSync(attachmentDir)) {
-			fs.mkdirSync(attachmentDir, { recursive: true });
+		const resolvedAttachmentDir = path.resolve(this.attachmentDir);
+		if (!fs.existsSync(resolvedAttachmentDir)) {
+			fs.mkdirSync(resolvedAttachmentDir, { recursive: true, mode: 0o700 });
 		}
+		fs.chmodSync(resolvedAttachmentDir, 0o700);
 
 		for (const attachment of attachments) {
 			try {
 				const sourceKey =
 					attachment.attachmentId?.substring(0, 8) || `part-${attachment.partPath.replace(/\./g, "-")}`;
-				const filename = `${attachment.messageId}_${sourceKey}_${attachment.filename}`;
-				const filePath = path.join(attachmentDir, filename);
+				const safeMessageId = attachment.messageId.replace(/[^A-Za-z0-9_-]/g, "_") || "msg";
+				const safeSourceKey = sourceKey.replace(/[^A-Za-z0-9_-]/g, "_") || "part";
+				const safeFilename = sanitizeInboundFilename(attachment.filename);
+				const filename = `${safeMessageId}_${safeSourceKey}_${safeFilename}`;
+				const filePath = path.resolve(resolvedAttachmentDir, filename);
+
+				if (!filePath.startsWith(resolvedAttachmentDir + path.sep)) {
+					throw new Error(`Refusing to write attachment outside attachments directory: ${attachment.filename}`);
+				}
 
 				if (attachment.inlineData) {
 					const data = Buffer.from(attachment.inlineData, "base64url");
@@ -372,7 +612,8 @@ export class GmailService {
 						continue;
 					}
 
-					fs.writeFileSync(filePath, data);
+					fs.writeFileSync(filePath, data, { mode: 0o600 });
+					fs.chmodSync(filePath, 0o600);
 					results.push({ success: true, filename: attachment.filename, path: filePath, cached: false });
 					continue;
 				}
@@ -402,7 +643,8 @@ export class GmailService {
 				});
 
 				const data = Buffer.from(response.data.data, "base64url");
-				fs.writeFileSync(filePath, data);
+				fs.writeFileSync(filePath, data, { mode: 0o600 });
+				fs.chmodSync(filePath, 0o600);
 
 				results.push({ success: true, filename: attachment.filename, path: filePath, cached: false });
 			} catch (e) {
@@ -864,6 +1106,9 @@ export class GmailService {
 			html?: boolean;
 		} = {},
 	): Promise<GmailDraft> {
+		if (options.attachments?.length) {
+			validateAttachmentPaths(options.attachments);
+		}
 		const gmail = this.getGmailClient(email);
 
 		const {
@@ -873,104 +1118,25 @@ export class GmailService {
 			subject: messageSubject,
 		} = await this.resolveReplyMetadata(gmail, subject, options);
 
-		const hasAttachments = options.attachments && options.attachments.length > 0;
-		const boundary = `boundary_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-		const contentType = options.html ? "text/html" : "text/plain";
+		const emailContent = buildRawMimeMessage({
+			from: email,
+			to,
+			subject: messageSubject,
+			body,
+			cc: options.cc,
+			bcc: options.bcc,
+			inReplyTo,
+			references,
+			attachments: options.attachments,
+			html: options.html,
+		});
 
-		const headers = [
-			`From: ${email}`,
-			`To: ${to.join(", ")}`,
-			options.cc?.length ? `Cc: ${options.cc.join(", ")}` : "",
-			options.bcc?.length ? `Bcc: ${options.bcc.join(", ")}` : "",
-			`Subject: ${encodeMimeHeader(messageSubject)}`,
-			inReplyTo ? `In-Reply-To: ${inReplyTo}` : "",
-			references ? `References: ${references}` : "",
-			"MIME-Version: 1.0",
-			hasAttachments
-				? `Content-Type: multipart/mixed; boundary="${boundary}"`
-				: `Content-Type: ${contentType}; charset=UTF-8`,
-		].filter(Boolean);
-
-		let emailContent: string;
-
-		if (hasAttachments) {
-			const parts: string[] = [];
-
-			// Body part
-			parts.push(`--${boundary}\r\n` + `Content-Type: ${contentType}; charset=UTF-8\r\n\r\n` + body);
-
-			// Attachment parts
-			for (const filePath of options.attachments!) {
-				const filename = path.basename(filePath);
-				const fileContent = fs.readFileSync(filePath);
-				const base64Content = fileContent.toString("base64");
-				const mimeType = this.getMimeType(filename);
-
-				parts.push(
-					`--${boundary}\r\n` +
-						`Content-Type: ${mimeType}\r\n` +
-						"Content-Transfer-Encoding: base64\r\n" +
-						`Content-Disposition: attachment; filename="${filename}"\r\n\r\n` +
-						base64Content,
-				);
-			}
-
-			emailContent = headers.join("\r\n") + "\r\n\r\n" + parts.join("\r\n") + `\r\n--${boundary}--`;
-		} else {
-			emailContent = headers.join("\r\n") + "\r\n\r\n" + body;
-		}
-
-		const encodedEmail = Buffer.from(emailContent).toString("base64url");
+		const encodedEmail = Buffer.from(emailContent, "utf8").toString("base64url");
 
 		const response = await gmail.users.drafts.create({
 			userId: "me",
 			requestBody: {
 				message: { raw: encodedEmail, threadId },
-			},
-		});
-
-		return response.data;
-	}
-
-	private getMimeType(filename: string): string {
-		const ext = path.extname(filename).toLowerCase();
-		const mimeTypes: Record<string, string> = {
-			".pdf": "application/pdf",
-			".doc": "application/msword",
-			".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-			".xls": "application/vnd.ms-excel",
-			".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-			".png": "image/png",
-			".jpg": "image/jpeg",
-			".jpeg": "image/jpeg",
-			".gif": "image/gif",
-			".txt": "text/plain",
-			".html": "text/html",
-			".zip": "application/zip",
-			".json": "application/json",
-		};
-		return mimeTypes[ext] || "application/octet-stream";
-	}
-
-	async updateDraft(email: string, draftId: string, body: string): Promise<GmailDraft> {
-		const gmail = this.getGmailClient(email);
-		const draft = await this.getDraft(email, draftId);
-		const message = draft.message;
-
-		if (!message) throw new Error("Draft message not found");
-
-		const existingRaw = message.raw ? Buffer.from(message.raw, "base64url").toString() : "";
-		const headerEnd = existingRaw.indexOf("\n\n");
-		const headers = headerEnd > 0 ? existingRaw.substring(0, headerEnd) : "";
-
-		const updatedEmail = `${headers}\n\n${body}`;
-		const encodedEmail = Buffer.from(updatedEmail).toString("base64url");
-
-		const response = await gmail.users.drafts.update({
-			userId: "me",
-			id: draftId,
-			requestBody: {
-				message: { raw: encodedEmail, threadId: message.threadId },
 			},
 		});
 
@@ -1012,6 +1178,9 @@ export class GmailService {
 			html?: boolean;
 		} = {},
 	): Promise<GmailMessage> {
+		if (options.attachments?.length) {
+			validateAttachmentPaths(options.attachments);
+		}
 		const gmail = this.getGmailClient(email);
 
 		const {
@@ -1021,54 +1190,20 @@ export class GmailService {
 			subject: messageSubject,
 		} = await this.resolveReplyMetadata(gmail, subject, options);
 
-		const hasAttachments = options.attachments && options.attachments.length > 0;
-		const boundary = `boundary_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-		const contentType = options.html ? "text/html" : "text/plain";
+		const emailContent = buildRawMimeMessage({
+			from: email,
+			to,
+			subject: messageSubject,
+			body,
+			cc: options.cc,
+			bcc: options.bcc,
+			inReplyTo,
+			references,
+			attachments: options.attachments,
+			html: options.html,
+		});
 
-		const headers = [
-			`From: ${email}`,
-			`To: ${to.join(", ")}`,
-			options.cc?.length ? `Cc: ${options.cc.join(", ")}` : "",
-			options.bcc?.length ? `Bcc: ${options.bcc.join(", ")}` : "",
-			`Subject: ${encodeMimeHeader(messageSubject)}`,
-			inReplyTo ? `In-Reply-To: ${inReplyTo}` : "",
-			references ? `References: ${references}` : "",
-			"MIME-Version: 1.0",
-			hasAttachments
-				? `Content-Type: multipart/mixed; boundary="${boundary}"`
-				: `Content-Type: ${contentType}; charset=UTF-8`,
-		].filter(Boolean);
-
-		let emailContent: string;
-
-		if (hasAttachments) {
-			const parts: string[] = [];
-
-			// Body part
-			parts.push(`--${boundary}\r\n` + `Content-Type: ${contentType}; charset=UTF-8\r\n\r\n` + body);
-
-			// Attachment parts
-			for (const filePath of options.attachments!) {
-				const filename = path.basename(filePath);
-				const fileContent = fs.readFileSync(filePath);
-				const base64Content = fileContent.toString("base64");
-				const mimeType = this.getMimeType(filename);
-
-				parts.push(
-					`--${boundary}\r\n` +
-						`Content-Type: ${mimeType}\r\n` +
-						"Content-Transfer-Encoding: base64\r\n" +
-						`Content-Disposition: attachment; filename="${filename}"\r\n\r\n` +
-						base64Content,
-				);
-			}
-
-			emailContent = headers.join("\r\n") + "\r\n\r\n" + parts.join("\r\n") + `\r\n--${boundary}--`;
-		} else {
-			emailContent = headers.join("\r\n") + "\r\n\r\n" + body;
-		}
-
-		const encodedEmail = Buffer.from(emailContent).toString("base64url");
+		const encodedEmail = Buffer.from(emailContent, "utf8").toString("base64url");
 
 		const response = await gmail.users.messages.send({
 			userId: "me",
@@ -1081,58 +1216,13 @@ export class GmailService {
 	async downloadMessageAttachments(email: string, messageId: string): Promise<DownloadedAttachment[]> {
 		const gmail = this.getGmailClient(email);
 		const response = await gmail.users.messages.get({ userId: "me", id: messageId });
-		const message = response.data;
+		const message: GmailMessage = response.data;
 
-		const attachmentMetadata: AttachmentDownloadTarget[] = collectAttachmentParts(message.payload).map(
-			(part: AttachmentPartInfo) => ({
-				messageId,
-				filename: part.filename,
-				size: part.size,
-				mimeType: part.mimeType,
-				attachmentId: part.attachmentId,
-				inlineData: part.inlineData,
-				partPath: part.partPath,
-			}),
-		);
-
-		const attachmentsToDownload = attachmentMetadata.filter(
-			(part: AttachmentDownloadTarget) => part.attachmentId || part.inlineData,
-		);
-
-		const downloadResults = await this.downloadAttachments(
+		return this.downloadPartsForMessages(
 			email,
-			attachmentsToDownload.map((att: AttachmentDownloadTarget) => ({
-				messageId: att.messageId,
-				attachmentId: att.attachmentId,
-				inlineData: att.inlineData,
-				filename: att.filename,
-				partPath: att.partPath,
-			})),
+			[{ ...message, id: message.id || messageId }],
+			`message ${messageId}`,
 		);
-
-		const downloadedAttachments: DownloadedAttachment[] = [];
-		for (let i = 0; i < attachmentsToDownload.length; i++) {
-			const attachment = attachmentsToDownload[i];
-			const result = downloadResults[i];
-			if (result.success && result.path) {
-				downloadedAttachments.push({
-					messageId: attachment.messageId,
-					filename: attachment.filename,
-					path: result.path,
-					size: attachment.size,
-					mimeType: attachment.mimeType,
-					cached: result.cached || false,
-				});
-			}
-		}
-
-		if (attachmentMetadata.length > 0 && downloadedAttachments.length === 0) {
-			console.error(
-				`[gmcli] Warning: attachment metadata listed ${attachmentMetadata.length} attachment(s), but none were downloaded for message ${messageId}.`,
-			);
-		}
-
-		return downloadedAttachments;
 	}
 
 	private getHeaderValue(message: GmailMessage, headerName: string): string | undefined {
