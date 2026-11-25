@@ -17,7 +17,10 @@
 	],
 	"scripts": {
 		"build": "tsc && chmod +x dist/cli.js",
-		"check": "biome check src/ --write --diagnostic-level=error && tsgo --noEmit",
+		"lint": "biome check src/",
+		"format": "biome check src/ --write",
+		"typecheck": "tsc --noEmit",
+		"check": "npm run lint && npm run typecheck",
 		"test": "npm run build && node --test test/**/*.test.js",
 		"install-local": "bash scripts/install-local.sh",
 		"prepublishOnly": "npm run build",
@@ -30,7 +33,6 @@
 	"devDependencies": {
 		"@biomejs/biome": "^1.9.4",
 		"@types/node": "^22.10.1",
-		"@typescript/native-preview": "^7.0.0-dev.20251204.1",
 		"husky": "^9.1.7",
 		"typescript": "^5.7.2"
 	},
